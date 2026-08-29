@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from PIL import Image, ImageTk, ImageOps
 
@@ -228,25 +228,222 @@ class GPhotoController:
                 f"Nie można odczytać obrazu Live View: {exc}"
             )
 
-    def capture_photo(self):
-        filename = SAVE_DIR / datetime.now().strftime(
-            "photo_%Y-%m-%d_%H-%M-%S.jpg"
+    def reset_capture_setup(self):
+        """
+        Wymusza ponowne sprawdzenie ustawień przed następnym zdjęciem/serią.
+        """
+        self._capture_setup_ready = False
+
+    def _find_config_path(self, config_paths, candidate_names):
+        candidates = {
+            name.lower()
+            for name in candidate_names
+        }
+
+        for path in config_paths:
+            name = path.rstrip("/").split("/")[-1].lower()
+
+            if name in candidates:
+                return path
+
+        for path in config_paths:
+            path_lower = path.lower()
+
+            for candidate in candidates:
+                if path_lower.endswith("/" + candidate):
+                    return path
+
+        return None
+
+    def _set_choice_containing(
+        self,
+        config_paths,
+        candidate_names,
+        predicate,
+        description,
+        prefer=None,
+    ):
+        path = self._find_config_path(
+            config_paths,
+            candidate_names,
         )
+
+        if not path:
+            raise GPhotoError(
+                f"Nie znaleziono ustawienia aparatu: {description}."
+            )
+
+        config = self.get_config(path)
+        choices = config.get("choices", [])
+
+        matches = []
+
+        for _, value in choices:
+            value_lower = value.lower()
+
+            if predicate(value_lower):
+                score = prefer(value_lower) if prefer else 0
+                matches.append((score, value))
+
+        if not matches:
+            available = ", ".join(
+                value
+                for _, value in choices
+            ) or "brak listy opcji"
+
+            raise GPhotoError(
+                f"Aparat nie udostępnia oczekiwanej opcji: {description}.\n"
+                f"Dostępne wartości: {available}"
+            )
+
+        matches.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        selected = matches[0][1]
+
+        if config.get("current") != selected:
+            self.set_config(path, selected)
+
+        return selected
+
+    def prepare_capture_setup(self):
+        """
+        Przed fotografowaniem:
+        1. ustaw zapis do karty pamięci,
+        2. ustaw RAW (NEF) + JPEG.
+
+        Robimy to raz na pojedyncze zdjęcie albo raz na całą serię.
+        """
+        if getattr(self, "_capture_setup_ready", False):
+            return
+
+        config_paths = self.list_config()
+
+        # Nikon/gPhoto2 często domyślnie używa "Internal RAM"
+        # podczas zdalnego fotografowania. Wymuszamy kartę pamięci,
+        # aby --keep rzeczywiście zostawiał kopię na SD.
+        self._set_choice_containing(
+            config_paths,
+            [
+                "capturetarget",
+                "capture-target",
+            ],
+            lambda value: (
+                "memory card" in value
+                or value == "card"
+                or "sd card" in value
+                or "karta" in value
+            ),
+            "miejsce zapisu = karta pamięci",
+        )
+
+        # D5300 zapisuje RAW jako NEF. Szukamy opcji zawierającej
+        # jednocześnie RAW/NEF oraz JPEG/JPG.
+        def raw_jpeg_choice(value):
+            has_raw = (
+                "raw" in value
+                or "nef" in value
+            )
+            has_jpeg = (
+                "jpeg" in value
+                or "jpg" in value
+            )
+            return has_raw and has_jpeg
+
+        def quality_preference(value):
+            # Jeśli aparat ma kilka wariantów RAW+JPEG,
+            # preferujemy JPEG Fine.
+            if "fine" in value:
+                return 30
+            if "normal" in value:
+                return 20
+            if "basic" in value:
+                return 10
+            return 0
+
+        self._set_choice_containing(
+            config_paths,
+            [
+                "imagequality",
+                "imagequality2",
+                "image-quality",
+                "imageformat",
+                "image-format",
+            ],
+            raw_jpeg_choice,
+            "format RAW (NEF) + JPEG",
+            prefer=quality_preference,
+        )
+
+        self._capture_setup_ready = True
+
+    def capture_photo(self, save_dir):
+        save_dir = Path(save_dir).expanduser()
+        save_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.prepare_capture_setup()
+
+        # Jeden wspólny basename dla pary JPG + NEF.
+        # %C jest rozwijane przez gphoto2 do oryginalnego rozszerzenia
+        # pliku, więc dostajemy np.:
+        # photo_... .JPG
+        # photo_... .NEF
+        stamp = datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S_%f"
+        )
+        basename = f"photo_{stamp}"
+        filename_pattern = save_dir / f"{basename}.%C"
 
         self.run(
             "--force-overwrite",
             "--filename",
-            str(filename),
+            str(filename_pattern),
             "--capture-image-and-download",
-            timeout=60,
+            "--keep",
+            timeout=120,
         )
 
-        if not filename.exists():
+        files = sorted(
+            path
+            for path in save_dir.glob(f"{basename}.*")
+            if path.is_file()
+        )
+
+        jpeg_files = [
+            path
+            for path in files
+            if path.suffix.lower() in {".jpg", ".jpeg"}
+        ]
+
+        raw_files = [
+            path
+            for path in files
+            if path.suffix.lower() == ".nef"
+        ]
+
+        if not jpeg_files or not raw_files:
+            found = ", ".join(
+                path.name
+                for path in files
+            ) or "brak"
+
             raise GPhotoError(
-                "gphoto2 wykonał zdjęcie, ale plik nie został znaleziony."
+                "Zdjęcie zostało wykonane, ale na dysku nie znaleziono "
+                "obu wymaganych wersji JPG + NEF (RAW).\n"
+                f"Znalezione pliki: {found}\n\n"
+                "Sprawdź, czy aparat pozwala ustawić RAW+JPEG przez gphoto2."
             )
 
-        return filename
+        return {
+            "files": files,
+            "jpeg": jpeg_files[0],
+            "raw": raw_files[0],
+        }
 
 
 # ============================================================
@@ -481,6 +678,13 @@ class GPhotoGUI:
         self.status_var = tk.StringVar(
             value="Uruchamianie..."
         )
+
+        self.save_dir_var = tk.StringVar(
+            value=str(SAVE_DIR)
+        )
+
+        # Folder używany przez aktualnie trwającą serię.
+        self.series_save_dir = SAVE_DIR
 
         # Seria / timelapse
         self.series_count_var = tk.IntVar(value=50)
@@ -812,13 +1016,52 @@ class GPhotoGUI:
             anchor="w",
         )
 
+        save_dir_frame = ttk.Frame(
+            sidebar,
+        )
+
+        save_dir_frame.pack(
+            fill="x",
+            pady=(3, 5),
+        )
+
+        save_dir_frame.columnconfigure(
+            0,
+            weight=1,
+        )
+
+        self.save_dir_entry = ttk.Entry(
+            save_dir_frame,
+            textvariable=self.save_dir_var,
+            state="readonly",
+            width=28,
+        )
+
+        self.save_dir_entry.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 6),
+        )
+
+        self.save_dir_button = ttk.Button(
+            save_dir_frame,
+            text="Wybierz…",
+            command=self.choose_save_directory,
+        )
+
+        self.save_dir_button.grid(
+            row=0,
+            column=1,
+        )
+
         ttk.Label(
             sidebar,
-            text=str(SAVE_DIR),
+            text="RAW (NEF) + JPEG  •  karta SD + dysk",
             wraplength=300,
         ).pack(
             anchor="w",
-            pady=(3, 10),
+            pady=(0, 10),
         )
 
         # ====================================================
@@ -938,6 +1181,69 @@ class GPhotoGUI:
             side="bottom",
             fill="x",
         )
+
+    def choose_save_directory(self):
+        current = Path(
+            self.save_dir_var.get()
+        ).expanduser()
+
+        initial_dir = (
+            current
+            if current.exists()
+            else Path.home()
+        )
+
+        selected = filedialog.askdirectory(
+            title="Wybierz folder na zdjęcia",
+            initialdir=str(initial_dir),
+            mustexist=True,
+        )
+
+        if not selected:
+            return
+
+        self.save_dir_var.set(
+            str(Path(selected))
+        )
+
+        self.status_var.set(
+            f"Folder zapisu: {selected}"
+        )
+
+    def get_save_directory(self):
+        value = self.save_dir_var.get().strip()
+
+        if not value:
+            raise ValueError(
+                "Nie wybrano folderu zapisu."
+            )
+
+        save_dir = Path(value).expanduser()
+
+        try:
+            save_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"Nie można użyć folderu zapisu:\n{exc}"
+            ) from exc
+
+        if not save_dir.is_dir():
+            raise ValueError(
+                "Wybrana ścieżka nie jest folderem."
+            )
+
+        if not os.access(
+            save_dir,
+            os.W_OK,
+        ):
+            raise ValueError(
+                "Brak uprawnień do zapisu w wybranym folderze."
+            )
+
+        return save_dir
 
     # --------------------------------------------------------
     # INIT
@@ -1325,16 +1631,30 @@ class GPhotoGUI:
         if not self.controller:
             return
 
+        try:
+            save_dir = self.get_save_directory()
+        except ValueError as exc:
+            messagebox.showerror(
+                "Folder zapisu",
+                str(exc),
+            )
+            return
+
+        # Przy pojedynczym zdjęciu ponownie sprawdzamy,
+        # czy aparat nadal ma ustawione karta SD + RAW/JPEG.
+        self.controller.reset_capture_setup()
+
         self.capture_button.config(
             state="disabled"
         )
 
         self.status_var.set(
-            "Robię zdjęcie..."
+            "Robię zdjęcie RAW + JPEG..."
         )
 
         future = self.executor.submit(
-            self.controller.capture_photo
+            self.controller.capture_photo,
+            save_dir,
         )
 
         future.add_done_callback(
@@ -1351,7 +1671,7 @@ class GPhotoGUI:
         )
 
         try:
-            filename = future.result()
+            result = future.result()
 
         except Exception as exc:
             self.status_var.set(
@@ -1366,7 +1686,9 @@ class GPhotoGUI:
             return
 
         try:
-            image = Image.open(filename)
+            image = Image.open(
+                result["jpeg"]
+            )
             image.load()
 
             self.display_last_image(
@@ -1375,13 +1697,14 @@ class GPhotoGUI:
 
         except Exception as exc:
             self.status_var.set(
-                f"Zdjęcie zapisane, ale podgląd się nie udał: {exc}"
+                "RAW + JPEG zapisane, ale podgląd JPEG się nie udał: "
+                f"{exc}"
             )
-
             return
 
         self.status_var.set(
-            f"Zapisano: {filename.name}"
+            "Zapisano na dysku i karcie: "
+            f"{result['jpeg'].name} + {result['raw'].name}"
         )
 
     # --------------------------------------------------------
@@ -1417,6 +1740,19 @@ class GPhotoGUI:
             )
             return
 
+        try:
+            self.series_save_dir = self.get_save_directory()
+        except ValueError as exc:
+            messagebox.showerror(
+                "Folder zapisu",
+                str(exc),
+            )
+            return
+
+        # Przed każdą nową serią ponownie wymuszamy:
+        # karta pamięci + RAW/JPEG.
+        self.controller.reset_capture_setup()
+
         # Live View stale odpytuje aparat. Podczas serii wyłączamy go,
         # aby polecenia nie konkurowały ze sobą o połączenie USB.
         if self.live_enabled:
@@ -1433,6 +1769,7 @@ class GPhotoGUI:
         self.series_stop_button.config(state="normal")
         self.capture_button.config(state="disabled")
         self.refresh_button.config(state="disabled")
+        self.save_dir_button.config(state="disabled")
 
         self.series_progress_var.set(
             f"0 / {self.series_total}"
@@ -1509,7 +1846,8 @@ class GPhotoGUI:
         )
 
         future = self.executor.submit(
-            self.controller.capture_photo
+            self.controller.capture_photo,
+            self.series_save_dir,
         )
 
         future.add_done_callback(
@@ -1525,7 +1863,7 @@ class GPhotoGUI:
         self.series_capture_in_progress = False
 
         try:
-            filename = future.result()
+            result = future.result()
 
         except Exception as exc:
             was_running = self.series_running
@@ -1546,19 +1884,20 @@ class GPhotoGUI:
                 )
             return
 
-        # Zdjęcie zostało wykonane nawet wtedy, gdy użytkownik kliknął
-        # „Zatrzymaj” w trakcie ekspozycji.
+        # Para JPG + NEF została zapisana na dysku,
+        # a --keep pozostawił obie wersje także na karcie.
         self.series_done = shot_number
 
         try:
-            image = Image.open(filename)
+            image = Image.open(
+                result["jpeg"]
+            )
             image.load()
             self.display_last_image(
                 image.copy()
             )
         except Exception:
-            # Brak podglądu (np. nieobsługiwany format RAW) nie powinien
-            # zatrzymywać całej serii.
+            # Brak podglądu JPEG nie powinien zatrzymywać całej serii.
             pass
 
         self.series_progress_var.set(
@@ -1638,6 +1977,7 @@ class GPhotoGUI:
         self.refresh_button.config(
             state="normal" if self.controller else "disabled"
         )
+        self.save_dir_button.config(state="normal")
 
     def test_completion_sound(self):
         """Ręczny test dźwięku z poziomu GUI."""
