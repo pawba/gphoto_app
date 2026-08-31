@@ -767,8 +767,12 @@ class GPhotoGUI:
         self.live_enabled = False
         self.closing = False
 
-        self.live_photoimage = None
-        self.last_photoimage = None
+        # Jeden duży panel obrazu zamiast dwóch mniejszych.
+        self.viewer_photoimage = None
+        self.live_image_pil = None
+        self.last_image_pil = None
+        self.viewer_mode = tk.StringVar(value="last")
+        self.viewer_resize_after = None
 
         self.controller = None
         self.config_paths = []
@@ -1163,7 +1167,7 @@ class GPhotoGUI:
         )
 
         # ====================================================
-        # OBRAZY
+        # PODGLĄD OBRAZU
         # ====================================================
 
         images = ttk.Frame(main)
@@ -1179,89 +1183,86 @@ class GPhotoGUI:
             weight=1,
         )
 
-        images.columnconfigure(
+        images.rowconfigure(
             1,
             weight=1,
         )
 
-        images.rowconfigure(
-            0,
-            weight=1,
-        )
-
-        # LIVE
-
-        live_frame = ttk.LabelFrame(
+        # Przełącznik pomiędzy ostatnim zdjęciem a Live View.
+        viewer_toolbar = ttk.Frame(
             images,
-            text="Live View",
-            padding=6,
         )
 
-        live_frame.grid(
+        viewer_toolbar.grid(
             row=0,
             column=0,
-            sticky="nsew",
-            padx=(0, 5),
+            sticky="ew",
+            pady=(0, 6),
         )
 
-        live_frame.rowconfigure(
-            0,
-            weight=1,
+        self.viewer_last_button = ttk.Button(
+            viewer_toolbar,
+            text="📷 Ostatnie zdjęcie",
+            command=lambda: self.set_viewer_mode("last"),
         )
 
-        live_frame.columnconfigure(
-            0,
-            weight=1,
+        self.viewer_last_button.pack(
+            side="left",
+            padx=(0, 6),
         )
 
-        self.live_image_label = ttk.Label(
-            live_frame,
-            text="Live View wyłączony",
-            anchor="center",
+        self.viewer_live_button = ttk.Button(
+            viewer_toolbar,
+            text="▶ Live View",
+            command=lambda: self.set_viewer_mode("live"),
         )
 
-        self.live_image_label.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
+        self.viewer_live_button.pack(
+            side="left",
         )
 
-        # LAST PHOTO
-
-        last_frame = ttk.LabelFrame(
+        self.viewer_frame = ttk.LabelFrame(
             images,
             text="Ostatnie zdjęcie",
             padding=6,
         )
 
-        last_frame.grid(
-            row=0,
-            column=1,
+        self.viewer_frame.grid(
+            row=1,
+            column=0,
             sticky="nsew",
-            padx=(5, 0),
         )
 
-        last_frame.rowconfigure(
+        self.viewer_frame.rowconfigure(
             0,
             weight=1,
         )
 
-        last_frame.columnconfigure(
+        self.viewer_frame.columnconfigure(
             0,
             weight=1,
         )
 
-        self.last_image_label = ttk.Label(
-            last_frame,
+        self.viewer_image_label = ttk.Label(
+            self.viewer_frame,
             text="Nie wykonano jeszcze zdjęcia",
             anchor="center",
         )
 
-        self.last_image_label.grid(
+        self.viewer_image_label.grid(
             row=0,
             column=0,
             sticky="nsew",
         )
+
+        # Przy zmianie rozmiaru okna ponownie dopasowujemy obraz,
+        # żeby wykorzystać cały dostępny panel.
+        self.viewer_image_label.bind(
+            "<Configure>",
+            self.on_viewer_resize,
+        )
+
+        self.update_viewer_buttons()
 
         # ====================================================
         # STATUS
@@ -1661,16 +1662,12 @@ class GPhotoGUI:
                 text="▶ Live View"
             )
 
-            self.live_image_label.config(
-                image="",
-                text="Live View zatrzymany",
-            )
-
-            self.live_photoimage = None
-
             self.status_var.set(
                 "Live View zatrzymany"
             )
+
+            if self.viewer_mode.get() == "live":
+                self.refresh_viewer()
 
     def request_live_frame(self):
         if (
@@ -2279,18 +2276,84 @@ class GPhotoGUI:
         ).start()
 
     # --------------------------------------------------------
-    # IMAGES
+    # IMAGES / JEDEN DUŻY PODGLĄD
     # --------------------------------------------------------
+
+    def set_viewer_mode(self, mode):
+        if mode not in {"last", "live"}:
+            return
+
+        self.viewer_mode.set(mode)
+        self.update_viewer_buttons()
+        self.refresh_viewer()
+
+    def update_viewer_buttons(self):
+        mode = self.viewer_mode.get()
+
+        # Aktywny widok ma wyłączony odpowiadający mu przycisk,
+        # dzięki czemu od razu widać, który panel jest wybrany.
+        self.viewer_last_button.config(
+            state="disabled" if mode == "last" else "normal"
+        )
+
+        self.viewer_live_button.config(
+            state="disabled" if mode == "live" else "normal"
+        )
+
+        self.viewer_frame.config(
+            text=(
+                "Live View"
+                if mode == "live"
+                else "Ostatnie zdjęcie"
+            )
+        )
+
+    def on_viewer_resize(self, _event=None):
+        # Configure może wywoływać się wiele razy podczas przeciągania
+        # rozmiaru okna, więc odświeżamy z małym opóźnieniem.
+        if self.viewer_resize_after is not None:
+            try:
+                self.root.after_cancel(
+                    self.viewer_resize_after
+                )
+            except tk.TclError:
+                pass
+
+        self.viewer_resize_after = self.root.after(
+            100,
+            self.refresh_viewer,
+        )
+
+    def get_viewer_max_size(self):
+        width = self.viewer_image_label.winfo_width()
+        height = self.viewer_image_label.winfo_height()
+
+        # Przy pierwszym renderze Tk może jeszcze raportować 1x1.
+        if width < 100:
+            width = 900
+        if height < 100:
+            height = 700
+
+        return (
+            max(100, width - 12),
+            max(100, height - 12),
+        )
 
     def prepare_image(
         self,
         image,
-        max_size=(650, 650),
+        max_size=None,
     ):
-        # Obrót na podstawie EXIF
+        # Pracujemy na kopii, bo thumbnail modyfikuje obraz.
+        image = image.copy()
+
+        # Obrót na podstawie EXIF.
         image = ImageOps.exif_transpose(
             image
         )
+
+        if max_size is None:
+            max_size = self.get_viewer_max_size()
 
         image.thumbnail(
             max_size,
@@ -2299,35 +2362,74 @@ class GPhotoGUI:
 
         return image
 
-    def display_live_image(self, image):
-        image = self.prepare_image(
+    def render_viewer_image(self, image):
+        prepared = self.prepare_image(
             image,
-            (650, 650),
+            self.get_viewer_max_size(),
         )
 
-        self.live_photoimage = ImageTk.PhotoImage(
-            image
+        self.viewer_photoimage = ImageTk.PhotoImage(
+            prepared
         )
 
-        self.live_image_label.config(
-            image=self.live_photoimage,
+        self.viewer_image_label.config(
+            image=self.viewer_photoimage,
             text="",
         )
+
+    def refresh_viewer(self):
+        self.viewer_resize_after = None
+        mode = self.viewer_mode.get()
+
+        if mode == "live":
+            if self.live_image_pil is not None:
+                self.render_viewer_image(
+                    self.live_image_pil
+                )
+            else:
+                self.viewer_photoimage = None
+                self.viewer_image_label.config(
+                    image="",
+                    text=(
+                        "Live View uruchomiony — czekam na obraz..."
+                        if self.live_enabled
+                        else "Live View wyłączony"
+                    ),
+                )
+
+        else:
+            if self.last_image_pil is not None:
+                self.render_viewer_image(
+                    self.last_image_pil
+                )
+            else:
+                self.viewer_photoimage = None
+                self.viewer_image_label.config(
+                    image="",
+                    text="Nie wykonano jeszcze zdjęcia",
+                )
+
+    def display_live_image(self, image):
+        # Zachowujemy pełniejszą wersję PIL, a skalowanie wykonujemy
+        # dopiero dla aktualnego rozmiaru dużego panelu.
+        self.live_image_pil = ImageOps.exif_transpose(
+            image.copy()
+        )
+
+        if self.viewer_mode.get() == "live":
+            self.render_viewer_image(
+                self.live_image_pil
+            )
 
     def display_last_image(self, image):
-        image = self.prepare_image(
-            image,
-            (650, 650),
+        self.last_image_pil = ImageOps.exif_transpose(
+            image.copy()
         )
 
-        self.last_photoimage = ImageTk.PhotoImage(
-            image
-        )
-
-        self.last_image_label.config(
-            image=self.last_photoimage,
-            text="",
-        )
+        if self.viewer_mode.get() == "last":
+            self.render_viewer_image(
+                self.last_image_pil
+            )
 
     # --------------------------------------------------------
     # CLOSE
@@ -2344,6 +2446,15 @@ class GPhotoGUI:
             except tk.TclError:
                 pass
             self.series_after_id = None
+
+        if self.viewer_resize_after is not None:
+            try:
+                self.root.after_cancel(
+                    self.viewer_resize_after
+                )
+            except tk.TclError:
+                pass
+            self.viewer_resize_after = None
 
         self.executor.shutdown(
             wait=False,
