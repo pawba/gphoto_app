@@ -342,15 +342,51 @@ class GPhotoController:
         # D5300 zapisuje RAW jako NEF. Szukamy opcji zawierającej
         # jednocześnie RAW/NEF oraz JPEG/JPG.
         def raw_jpeg_choice(value):
+            """
+            Nikon/libgphoto2 często nazywa tryby RAW+JPEG jako:
+                NEF+Fine
+                NEF+Normal
+                NEF+Basic
+            bez użycia słowa "JPEG".
+
+            Obsługujemy zarówno takie nazwy, jak i warianty typu
+            "NEF (RAW) + JPEG Fine".
+            """
+            raw_value = value.lower()
+            normalized = (
+                raw_value
+                .replace(" ", "")
+                .replace("_", "")
+                .replace("-", "")
+            )
+
             has_raw = (
-                "raw" in value
-                or "nef" in value
+                "raw" in normalized
+                or "nef" in normalized
             )
-            has_jpeg = (
-                "jpeg" in value
-                or "jpg" in value
+
+            explicit_jpeg = (
+                "jpeg" in normalized
+                or "jpg" in normalized
             )
-            return has_raw and has_jpeg
+
+            has_quality_word = any(
+                quality in normalized
+                for quality in ("fine", "normal", "basic")
+            )
+
+            nikon_combined_mode = (
+                (
+                    "nef+" in raw_value.replace(" ", "")
+                    or "raw+" in raw_value.replace(" ", "")
+                )
+                and has_quality_word
+            )
+
+            return has_raw and (
+                explicit_jpeg
+                or nikon_combined_mode
+            )
 
         def quality_preference(value):
             # Jeśli aparat ma kilka wariantów RAW+JPEG,
