@@ -2,6 +2,7 @@
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -88,12 +89,17 @@ class GPhotoController:
     def run(self, *args, binary=False, timeout=30):
         cmd = [GPHOTO2, *args]
 
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+
         try:
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise GPhotoError(
@@ -416,6 +422,15 @@ class GPhotoController:
         self._capture_setup_ready = True
 
     def capture_photo(self, save_dir):
+        """
+        Etap 1:
+        - wykonuje zdjęcie w trybie NEF+JPEG,
+        - zostawia OBA pliki na karcie SD,
+        - pobiera na komputer tylko JPEG.
+
+        Dzięki --keep-raw JPEG jest dostępny do podglądu znacznie wcześniej.
+        NEF jest pobierany osobno przez download_raw().
+        """
         save_dir = Path(save_dir).expanduser()
         save_dir.mkdir(
             parents=True,
@@ -424,26 +439,23 @@ class GPhotoController:
 
         self.prepare_capture_setup()
 
-        # Jeden wspólny basename dla pary JPG + NEF.
-        # %C jest rozwijane przez gphoto2 do oryginalnego rozszerzenia
-        # pliku, więc dostajemy np.:
-        # photo_... .JPG
-        # photo_... .NEF
         stamp = datetime.now().strftime(
             "%Y-%m-%d_%H-%M-%S_%f"
         )
         basename = f"photo_{stamp}"
         filename_pattern = save_dir / f"{basename}.%C"
 
-        self.run(
+        output = self.run(
             "--force-overwrite",
             "--filename",
             str(filename_pattern),
             "--capture-image-and-download",
             "--keep",
+            "--keep-raw",
             timeout=120,
         )
 
+        # Lokalnie powinien być już JPEG.
         files = sorted(
             path
             for path in save_dir.glob(f"{basename}.*")
@@ -456,30 +468,80 @@ class GPhotoController:
             if path.suffix.lower() in {".jpg", ".jpeg"}
         ]
 
-        raw_files = [
-            path
-            for path in files
-            if path.suffix.lower() == ".nef"
-        ]
-
-        if not jpeg_files or not raw_files:
+        if not jpeg_files:
             found = ", ".join(
                 path.name
                 for path in files
             ) or "brak"
 
             raise GPhotoError(
-                "Zdjęcie zostało wykonane, ale na dysku nie znaleziono "
-                "obu wymaganych wersji JPG + NEF (RAW).\n"
-                f"Znalezione pliki: {found}\n\n"
-                "Sprawdź, czy aparat pozwala ustawić RAW+JPEG przez gphoto2."
+                "Zdjęcie zostało wykonane, ale JPEG nie pojawił się "
+                "na dysku.\n"
+                f"Znalezione pliki: {found}"
             )
 
+        # gphoto2 z --keep-raw wypisuje lokalizację NEF na aparacie,
+        # ale go jeszcze nie pobiera. Przy wymuszonym LC_ALL=C format
+        # komunikatu jest przewidywalny.
+        raw_matches = re.findall(
+            r"(/[^\r\n]*?\.NEF)(?=\s|$)",
+            output,
+            flags=re.IGNORECASE,
+        )
+
+        if not raw_matches:
+            raise GPhotoError(
+                "JPEG został pobrany, ale program nie potrafił ustalić "
+                "lokalizacji pliku NEF na karcie.\n\n"
+                "RAW powinien nadal znajdować się na karcie SD."
+            )
+
+        raw_camera_path = raw_matches[-1]
+        raw_camera_folder, raw_camera_name = raw_camera_path.rsplit(
+            "/",
+            1,
+        )
+
+        if not raw_camera_folder:
+            raw_camera_folder = "/"
+
+        raw_local_path = save_dir / f"{basename}.NEF"
+
         return {
-            "files": files,
             "jpeg": jpeg_files[0],
-            "raw": raw_files[0],
+            "raw": raw_local_path,
+            "raw_camera_folder": raw_camera_folder,
+            "raw_camera_name": raw_camera_name,
         }
+
+    def download_raw(self, capture_result):
+        """
+        Etap 2:
+        pobiera NEF z karty do tego samego folderu na komputerze.
+        Plik na karcie NIE jest usuwany.
+        """
+        raw_local_path = Path(
+            capture_result["raw"]
+        )
+
+        self.run(
+            "--folder",
+            capture_result["raw_camera_folder"],
+            "--get-file",
+            capture_result["raw_camera_name"],
+            "--filename",
+            str(raw_local_path),
+            "--force-overwrite",
+            timeout=180,
+        )
+
+        if not raw_local_path.exists():
+            raise GPhotoError(
+                "Nie udało się pobrać pliku NEF na dysk. "
+                "RAW powinien nadal znajdować się na karcie SD."
+            )
+
+        return capture_result
 
 
 # ============================================================
@@ -1676,8 +1738,6 @@ class GPhotoGUI:
             )
             return
 
-        # Przy pojedynczym zdjęciu ponownie sprawdzamy,
-        # czy aparat nadal ma ustawione karta SD + RAW/JPEG.
         self.controller.reset_capture_setup()
 
         self.capture_button.config(
@@ -1688,6 +1748,7 @@ class GPhotoGUI:
             "Robię zdjęcie RAW + JPEG..."
         )
 
+        # Pierwszy etap pobiera tylko JPEG.
         future = self.executor.submit(
             self.controller.capture_photo,
             save_dir,
@@ -1696,20 +1757,20 @@ class GPhotoGUI:
         future.add_done_callback(
             lambda f: self.root.after(
                 0,
-                self.capture_done,
+                self.capture_jpeg_done,
                 f,
             )
         )
 
-    def capture_done(self, future):
-        self.capture_button.config(
-            state="normal"
-        )
-
+    def capture_jpeg_done(self, future):
         try:
             result = future.result()
 
         except Exception as exc:
+            self.capture_button.config(
+                state="normal"
+            )
+
             self.status_var.set(
                 f"Błąd wykonywania zdjęcia: {exc}"
             )
@@ -1718,9 +1779,10 @@ class GPhotoGUI:
                 "Błąd aparatu",
                 str(exc),
             )
-
             return
 
+        # JPEG jest już na dysku — pokazujemy go NATYCHMIAST,
+        # nie czekając na transfer dużego NEF-a.
         try:
             image = Image.open(
                 result["jpeg"]
@@ -1733,8 +1795,44 @@ class GPhotoGUI:
 
         except Exception as exc:
             self.status_var.set(
-                "RAW + JPEG zapisane, ale podgląd JPEG się nie udał: "
-                f"{exc}"
+                f"JPEG zapisany, ale podgląd się nie udał: {exc}"
+            )
+
+        self.status_var.set(
+            "JPEG gotowy • pobieram NEF w tle..."
+        )
+
+        # Drugi etap: RAW. Nadal używamy jednego wątku gphoto2,
+        # więc aparat nie dostaje równoległych poleceń USB.
+        raw_future = self.executor.submit(
+            self.controller.download_raw,
+            result,
+        )
+
+        raw_future.add_done_callback(
+            lambda f: self.root.after(
+                0,
+                self.capture_raw_done,
+                f,
+            )
+        )
+
+    def capture_raw_done(self, future):
+        self.capture_button.config(
+            state="normal"
+        )
+
+        try:
+            result = future.result()
+
+        except Exception as exc:
+            self.status_var.set(
+                f"JPEG zapisany; błąd pobierania RAW: {exc}"
+            )
+
+            messagebox.showerror(
+                "Błąd pobierania RAW",
+                str(exc),
             )
             return
 
@@ -1896,12 +1994,11 @@ class GPhotoGUI:
         )
 
     def _series_capture_done(self, future, shot_number):
-        self.series_capture_in_progress = False
-
         try:
             result = future.result()
 
         except Exception as exc:
+            self.series_capture_in_progress = False
             was_running = self.series_running
             self.series_running = False
             self._restore_after_series()
@@ -1920,10 +2017,7 @@ class GPhotoGUI:
                 )
             return
 
-        # Para JPG + NEF została zapisana na dysku,
-        # a --keep pozostawił obie wersje także na karcie.
-        self.series_done = shot_number
-
+        # JPEG jest już dostępny — aktualizujemy podgląd przed RAW-em.
         try:
             image = Image.open(
                 result["jpeg"]
@@ -1933,8 +2027,58 @@ class GPhotoGUI:
                 image.copy()
             )
         except Exception:
-            # Brak podglądu JPEG nie powinien zatrzymywać całej serii.
             pass
+
+        self.status_var.set(
+            f"Seria {shot_number}/{self.series_total}: "
+            "JPEG gotowy • pobieram NEF..."
+        )
+
+        self.series_progress_var.set(
+            f"{self.series_done} / {self.series_total}  •  RAW {shot_number}"
+        )
+
+        raw_future = self.executor.submit(
+            self.controller.download_raw,
+            result,
+        )
+
+        raw_future.add_done_callback(
+            lambda f, n=shot_number: self.root.after(
+                0,
+                self._series_raw_done,
+                f,
+                n,
+            )
+        )
+
+    def _series_raw_done(self, future, shot_number):
+        self.series_capture_in_progress = False
+
+        try:
+            future.result()
+
+        except Exception as exc:
+            was_running = self.series_running
+            self.series_running = False
+            self._restore_after_series()
+
+            self.status_var.set(
+                f"JPEG zapisany, ale błąd RAW przy {shot_number}: {exc}"
+            )
+            self.series_progress_var.set(
+                f"Błąd RAW przy {shot_number}/{self.series_total}"
+            )
+
+            if was_running:
+                messagebox.showerror(
+                    "Błąd pobierania RAW",
+                    str(exc),
+                )
+            return
+
+        # Dopiero teraz mamy JPG + NEF na dysku oraz oba pliki na karcie.
+        self.series_done = shot_number
 
         self.series_progress_var.set(
             f"{self.series_done} / {self.series_total}"
@@ -1954,10 +2098,9 @@ class GPhotoGUI:
             self._finish_series()
             return
 
-        # Interwał jest liczony od STARTU poprzedniej ekspozycji do
-        # STARTU następnej. Jeśli aparat potrzebował dłużej niż zadany
-        # interwał (np. długa ekspozycja + zapis), następna klatka
-        # rozpocznie się tak szybko, jak to możliwe.
+        # Interwał liczony jest od rozpoczęcia poprzedniej ekspozycji.
+        # Jeśli transfer RAW trwa dłużej, następna klatka ruszy od razu,
+        # gdy aparat będzie ponownie dostępny.
         elapsed = 0.0
         if self.series_last_start is not None:
             elapsed = time.monotonic() - self.series_last_start
