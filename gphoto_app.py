@@ -650,82 +650,40 @@ class GPhotoController:
 
         if not need_raw_path:
             # ----------------------------------------------------
-            # SZYBKI TRYB: RAW NA SD + MAŁY JPG PROXY NA LAPTOP
+            # ULTRASZYBKI TRYB: RAW NA SD, ZERO CZEKANIA NA FILEADDED
             # ----------------------------------------------------
+            # Użytkownik potwierdził na D5300, że samo --trigger-capture
+            # wraca po ok. 2 s, natomiast oczekiwanie na FILEADDED trwa
+            # ok. 39 s. Dlatego w krytycznej ścieżce fotografowania
+            # NIE czekamy na żadne zdarzenie plikowe i niczego nie
+            # pobieramy z aparatu. JPG proxy synchronizujemy dopiero
+            # po zakończeniu serii / podczas bezczynności.
             capture_started = time.monotonic()
-            output = self.run(
-                "--capture-image",
-                timeout=15,
-            )
-            capture_only_seconds = time.monotonic() - capture_started
-
-            # Dla RAW-only Nikon powinien zwrócić dokładną ścieżkę NEF-a.
-            raw_matches = re.findall(
-                r"(/[^\r\n]*?\.(?:NEF|RAW))(?=\s|$)",
-                output,
-                flags=re.IGNORECASE,
-            )
-            # Poprawka dla klasycznej ścieżki /store/.../DSC_0001.NEF.
-            if not raw_matches:
-                raw_matches = re.findall(
-                    r"(/[^\r\n]*?\.(?:NEF|RAW))(?=\s|$)",
-                    output,
-                    flags=re.IGNORECASE,
-                )
-
-            if not raw_matches:
-                raise GPhotoError(
-                    "Zdjęcie zostało wykonane, ale gphoto2 nie zwrócił "
-                    "ścieżki pliku RAW na karcie.\n\n"
-                    f"Odpowiedź gphoto2:\n{output.strip()}"
-                )
-
-            raw_camera_path = raw_matches[-1]
-            raw_camera_folder, raw_camera_name = raw_camera_path.rsplit("/", 1)
-            if not raw_camera_folder:
-                raw_camera_folder = "/"
-
-            proxy_path = save_dir / f"{basename}.jpg"
-
-            thumb_started = time.monotonic()
             try:
-                self.run(
-                    "--folder",
-                    raw_camera_folder,
-                    "--get-thumbnail",
-                    raw_camera_name,
-                    "--filename",
-                    str(proxy_path),
-                    "--force-overwrite",
-                    timeout=12,
+                output = self.run(
+                    "--trigger-capture",
+                    timeout=8,
                 )
-                proxy_source = "thumbnail"
-            except Exception:
-                # Niektóre kombinacje aparatu/libgphoto2 nie udostępniają
-                # thumbnail dla NEF. Awaryjnie pobieramy tylko klatkę preview
-                # i zapisujemy ją jako mały JPEG; RAW nadal nie jest pobierany.
-                image = self.capture_preview()
-                image.save(proxy_path, format="JPEG", quality=80, optimize=True)
-                proxy_source = "preview"
-
-            thumb_seconds = time.monotonic() - thumb_started
-            total_seconds = time.monotonic() - capture_started
-
-            if not proxy_path.exists() or proxy_path.stat().st_size <= 0:
+            except GPhotoError as exc:
                 raise GPhotoError(
-                    "RAW został zapisany na karcie, ale nie udało się utworzyć "
-                    "małego JPG proxy na laptopie."
-                )
+                    "D5300 nie zakończył --trigger-capture w 8 s.\n\n"
+                    "W ultraszybkim trybie nie czekamy na FILEADDED i nie "
+                    "pobieramy żadnego pliku podczas wykonywania klatki.\n\n"
+                    f"Szczegóły: {exc}"
+                ) from exc
 
+            capture_seconds = time.monotonic() - capture_started
             return {
-                "jpeg": proxy_path,
+                "jpeg": None,
                 "raw": None,
-                "raw_camera_folder": raw_camera_folder,
-                "raw_camera_name": raw_camera_name,
-                "capture_seconds": total_seconds,
-                "capture_only_seconds": capture_only_seconds,
-                "proxy_seconds": thumb_seconds,
-                "proxy_source": proxy_source,
+                "raw_camera_folder": None,
+                "raw_camera_name": None,
+                "capture_seconds": capture_seconds,
+                "capture_only_seconds": capture_seconds,
+                "proxy_seconds": None,
+                "proxy_source": "odroczony",
+                "proxy_pending": True,
+                "trigger_output": output,
             }
 
         # --------------------------------------------------------
@@ -786,6 +744,72 @@ class GPhotoController:
             "raw_camera_name": raw_camera_name,
             "capture_seconds": capture_seconds,
         }
+
+    def list_camera_raw_files(self, timeout=12):
+        """Zwraca listę (folder, nazwa) plików NEF/RAW widocznych na karcie."""
+        output = self.run("--list-files", timeout=timeout)
+        current_folder = None
+        files = []
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            folder_match = re.search(
+                r"folder\s+[\"']([^\"']+)[\"']",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if folder_match:
+                current_folder = folder_match.group(1)
+                continue
+
+            file_match = re.match(
+                r"#\d+\s+([^\s]+\.(?:NEF|RAW))(?:\s|$)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if file_match and current_folder:
+                files.append((current_folder, file_match.group(1)))
+
+        return files
+
+    def download_recent_raw_thumbnails(self, save_dir, count=1):
+        """
+        Po fotografowaniu pobiera wyłącznie miniatury ostatnich RAW-ów.
+        Ta funkcja nigdy nie jest wywoływana w krytycznej pętli serii.
+        """
+        save_dir = Path(save_dir).expanduser()
+        save_dir.mkdir(parents=True, exist_ok=True)
+        count = max(1, int(count))
+
+        files = self.list_camera_raw_files(timeout=12)
+        if not files:
+            raise GPhotoError(
+                "Na karcie nie znaleziono plików RAW do pobrania miniatury."
+            )
+
+        selected = files[-count:]
+        downloaded = []
+        for folder, name in selected:
+            proxy_path = save_dir / f"{Path(name).stem}.jpg"
+            self.run(
+                "--folder",
+                folder,
+                "--get-thumbnail",
+                name,
+                "--filename",
+                str(proxy_path),
+                "--force-overwrite",
+                timeout=6,
+            )
+            if proxy_path.exists() and proxy_path.stat().st_size > 0:
+                downloaded.append(proxy_path)
+
+        if not downloaded:
+            raise GPhotoError(
+                "RAW-y są na karcie, ale nie udało się pobrać żadnej miniatury JPG."
+            )
+
+        return downloaded
 
     def download_raw(self, capture_result):
         """
@@ -1064,6 +1088,9 @@ class GPhotoGUI:
         self.laptop_jpeg_only_var = tk.BooleanVar(value=True)
         self.current_capture_jpeg_only = False
         self.deferred_scan_after_id = None
+        self.deferred_proxy_after_id = None
+        self.deferred_proxy_count = 0
+        self.deferred_proxy_dir = SAVE_DIR
 
         # Folder i tryb używane przez aktualnie trwającą serię.
         self.series_save_dir = SAVE_DIR
@@ -1440,7 +1467,7 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="✓ Na laptop mały JPG proxy; pełny RAW tylko na SD",
+            text="⚡ Szybko: RAW na SD; mały JPG proxy po serii / w bezczynności",
             variable=self.laptop_jpeg_only_var,
             command=self.on_laptop_jpeg_only_changed,
         )
@@ -2040,7 +2067,7 @@ class GPhotoGUI:
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
-            "Ustawiam szybki tryb: RAW na SD + mały JPG proxy na laptop..."
+            "Ustawiam szybki tryb: RAW na SD; proxy JPG odroczone..."
             if fast_jpeg
             else "Przywracam JPEG Fine + RAW..."
         )
@@ -2074,7 +2101,7 @@ class GPhotoGUI:
                     )
                 else:
                     self.status_var.set(
-                        f"Tryb gotowy: {quality} na SD; mały JPG proxy na laptop"
+                        f"Tryb gotowy: {quality} na SD; bez FILEADDED w czasie zdjęć"
                     )
             else:
                 self.status_var.set(
@@ -2092,6 +2119,72 @@ class GPhotoGUI:
                     state="normal" if self.controller else "disabled"
                 )
                 self.laptop_jpeg_only_check.config(state="normal")
+
+    def _cancel_deferred_proxy_sync(self):
+        if self.deferred_proxy_after_id is not None:
+            try:
+                self.root.after_cancel(self.deferred_proxy_after_id)
+            except tk.TclError:
+                pass
+            self.deferred_proxy_after_id = None
+
+    def _schedule_deferred_proxy_sync(self, save_dir, count, delay_ms=4000):
+        """Synchronizuje małe JPG dopiero po bezczynności, nigdy między klatkami."""
+        self._cancel_deferred_proxy_sync()
+        if self.closing or not self.controller or count <= 0:
+            return
+        self.deferred_proxy_dir = Path(save_dir)
+        self.deferred_proxy_count = int(count)
+        self.deferred_proxy_after_id = self.root.after(
+            int(delay_ms),
+            self._start_deferred_proxy_sync,
+        )
+
+    def _start_deferred_proxy_sync(self):
+        self.deferred_proxy_after_id = None
+        if self.closing or not self.controller:
+            return
+        if self.series_running or self.live_enabled:
+            self._schedule_deferred_proxy_sync(
+                self.deferred_proxy_dir,
+                self.deferred_proxy_count,
+                delay_ms=4000,
+            )
+            return
+
+        count = self.deferred_proxy_count
+        save_dir = self.deferred_proxy_dir
+        self.status_var.set(
+            f"Zdjęcia zrobione; pobieram {count} małych JPG proxy bez RAW..."
+        )
+        future = self.executor.submit(
+            self.controller.download_recent_raw_thumbnails,
+            save_dir,
+            count,
+        )
+        future.add_done_callback(
+            lambda f: self.root.after(0, self._deferred_proxy_sync_done, f)
+        )
+
+    def _deferred_proxy_sync_done(self, future):
+        try:
+            paths = future.result()
+        except Exception as exc:
+            self.status_var.set(
+                f"Zdjęcia są na SD; proxy JPG nie pobrane: {exc}"
+            )
+            return
+
+        if paths:
+            try:
+                image = Image.open(paths[-1])
+                image.load()
+                self.display_last_image(image.copy())
+            except Exception:
+                pass
+            self.status_var.set(
+                f"Pobrano {len(paths)} małych JPG proxy • pełne RAW-y zostały na SD"
+            )
 
     def _cancel_deferred_settings_scan(self):
         if self.deferred_scan_after_id is not None:
@@ -2180,6 +2273,12 @@ class GPhotoGUI:
         self._restore_after_series()
         if play_sound:
             self.play_completion_sound()
+        if self.series_jpeg_only and self.series_done > 0:
+            self._schedule_deferred_proxy_sync(
+                self.series_save_dir,
+                self.series_done,
+                delay_ms=3000,
+            )
         self._schedule_deferred_settings_scan(self.series_jpeg_only)
 
     def _scan_after_series_done(
@@ -2227,6 +2326,7 @@ class GPhotoGUI:
         if not self.controller:
             return
         self._cancel_deferred_settings_scan()
+        self._cancel_deferred_proxy_sync()
 
         try:
             save_dir = self.get_save_directory()
@@ -2258,7 +2358,7 @@ class GPhotoGUI:
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
-            "Robię zdjęcie RAW + JPEG..."
+            "Wyzwalam migawkę..." if self.current_capture_jpeg_only else "Robię zdjęcie RAW + JPEG..."
         )
 
         # Pierwszy etap pobiera tylko JPEG. Ścieżkę RAW ustalamy tylko wtedy,
@@ -2305,54 +2405,31 @@ class GPhotoGUI:
             self._resume_live_after_single_capture()
             return
 
-        # JPEG jest już na dysku — pokazujemy go NATYCHMIAST,
-        # nie czekając na transfer dużego NEF-a.
-        try:
-            image = Image.open(
-                result["jpeg"]
-            )
-            image.load()
-
-            self.display_last_image(
-                image.copy()
-            )
-
-        except Exception as exc:
-            self.status_var.set(
-                f"JPEG zapisany, ale podgląd się nie udał: {exc}"
-            )
+        # W ultraszybkim trybie podczas wykonywania klatki nie pobieramy
+        # żadnego pliku. W trybie pełnym JPEG może być już dostępny.
+        if result.get("jpeg"):
+            try:
+                image = Image.open(result["jpeg"])
+                image.load()
+                self.display_last_image(image.copy())
+            except Exception as exc:
+                self.status_var.set(
+                    f"JPEG zapisany, ale podgląd się nie udał: {exc}"
+                )
 
         if self.current_capture_jpeg_only:
-            try:
-                jpeg_mb = result["jpeg"].stat().st_size / (1024 * 1024)
-                jpeg_info = f"{jpeg_mb:.1f} MB"
-            except OSError:
-                jpeg_info = "rozmiar nieznany"
-
-            try:
-                with Image.open(result["jpeg"]) as info_image:
-                    jpeg_dims = f"{info_image.width}×{info_image.height}"
-            except Exception:
-                jpeg_dims = "?×?"
-
             capture_seconds = result.get("capture_seconds")
-            capture_only = result.get("capture_only_seconds")
-            proxy_seconds = result.get("proxy_seconds")
-            source = result.get("proxy_source", "thumbnail")
-            parts = []
-            if isinstance(capture_only, (int, float)):
-                parts.append(f"RAW→SD {capture_only:.1f} s")
-            if isinstance(proxy_seconds, (int, float)):
-                parts.append(f"proxy→USB {proxy_seconds:.1f} s")
-            if not parts and isinstance(capture_seconds, (int, float)):
-                parts.append(f"razem {capture_seconds:.1f} s")
-            time_info = (" • " + " • ".join(parts)) if parts else ""
-
+            time_text = (
+                f"{capture_seconds:.1f} s"
+                if isinstance(capture_seconds, (int, float))
+                else "gotowe"
+            )
             final_status = (
-                f"JPG proxy: {result['jpeg'].name} • {jpeg_dims} • {jpeg_info}"
-                f"{time_info} • źródło: {source} • pełny RAW tylko na SD"
+                f"Migawka zakończona w {time_text} • RAW tylko na SD • "
+                "nie czekam na FILEADDED; JPG proxy pobiorę po 10 s bezczynności"
             )
             self._scan_after_single_capture(final_status)
+            self._schedule_deferred_proxy_sync(save_dir=Path(self.save_dir_var.get()), count=1, delay_ms=10000)
             return
 
         self.status_var.set(
@@ -2401,6 +2478,7 @@ class GPhotoGUI:
         if not self.controller or self.series_running:
             return
         self._cancel_deferred_settings_scan()
+        self._cancel_deferred_proxy_sync()
 
         try:
             count = int(self.series_count_var.get())
@@ -2579,24 +2657,22 @@ class GPhotoGUI:
             )
             return
 
-        # JPEG jest już dostępny — aktualizujemy podgląd przed RAW-em.
-        try:
-            image = Image.open(
-                result["jpeg"]
-            )
-            image.load()
-            self.display_last_image(
-                image.copy()
-            )
-        except Exception:
-            pass
+        # W ultraszybkim trybie nie pobieramy nic między klatkami.
+        if result.get("jpeg"):
+            try:
+                image = Image.open(result["jpeg"])
+                image.load()
+                self.display_last_image(image.copy())
+            except Exception:
+                pass
 
         if self.series_jpeg_only:
             self.series_capture_in_progress = False
             capture_seconds = result.get("capture_seconds")
             if isinstance(capture_seconds, (int, float)):
                 self.status_var.set(
-                    f"Seria {shot_number}/{self.series_total}: JPG proxy gotowy w {capture_seconds:.1f} s • pełny RAW tylko SD"
+                    f"Seria {shot_number}/{self.series_total}: trigger {capture_seconds:.1f} s • "
+                    "RAW na SD • bez czekania na FILEADDED"
                 )
             self._series_shot_finished(shot_number, jpeg_only=True)
             return
@@ -2693,7 +2769,7 @@ class GPhotoGUI:
             self.series_interval - elapsed,
         )
 
-        mode_text = "JPG proxy na laptopie; RAW na SD" if jpeg_only else "JPEG + RAW na laptopie"
+        mode_text = "RAW na SD; proxy JPG dopiero po serii" if jpeg_only else "JPEG + RAW na laptopie"
         self.status_var.set(
             f"Seria: {self.series_done}/{self.series_total}; {mode_text}; "
             f"następne za {wait_seconds:.1f} s"
