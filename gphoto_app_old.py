@@ -421,7 +421,7 @@ class GPhotoController:
 
         self._capture_setup_ready = True
 
-    def capture_photo(self, save_dir, need_raw_path=True):
+    def capture_photo(self, save_dir):
         """
         Etap 1:
         - wykonuje zdjęcie w trybie NEF+JPEG,
@@ -429,8 +429,7 @@ class GPhotoController:
         - pobiera na komputer tylko JPEG.
 
         Dzięki --keep-raw JPEG jest dostępny do podglądu znacznie wcześniej.
-        NEF jest pobierany osobno przez download_raw(), ale tylko gdy GUI
-        rzeczywiście chce zapisać RAW także na laptopie.
+        NEF jest pobierany osobno przez download_raw().
         """
         save_dir = Path(save_dir).expanduser()
         save_dir.mkdir(
@@ -480,16 +479,6 @@ class GPhotoController:
                 "na dysku.\n"
                 f"Znalezione pliki: {found}"
             )
-
-        # Jeśli na laptop ma trafić tylko JPEG, kończymy tutaj.
-        # RAW/NEF pozostaje na karcie SD i w ogóle nie jest transmitowany USB.
-        if not need_raw_path:
-            return {
-                "jpeg": jpeg_files[0],
-                "raw": None,
-                "raw_camera_folder": None,
-                "raw_camera_name": None,
-            }
 
         # gphoto2 z --keep-raw wypisuje lokalizację NEF na aparacie,
         # ale go jeszcze nie pobiera. Przy wymuszonym LC_ALL=C format
@@ -796,14 +785,8 @@ class GPhotoGUI:
             value=str(SAVE_DIR)
         )
 
-        # Gdy włączone, na laptop trafia tylko JPEG.
-        # RAW/NEF nadal zostaje na karcie SD aparatu.
-        self.laptop_jpeg_only_var = tk.BooleanVar(value=False)
-        self.current_capture_jpeg_only = False
-
-        # Folder i tryb używane przez aktualnie trwającą serię.
+        # Folder używany przez aktualnie trwającą serię.
         self.series_save_dir = SAVE_DIR
-        self.series_jpeg_only = False
 
         # Seria / timelapse
         self.series_count_var = tk.IntVar(value=50)
@@ -1174,20 +1157,9 @@ class GPhotoGUI:
             column=1,
         )
 
-        self.laptop_jpeg_only_check = ttk.Checkbutton(
-            sidebar,
-            text="Na laptop tylko JPEG (RAW zostaje na karcie SD)",
-            variable=self.laptop_jpeg_only_var,
-        )
-        self.laptop_jpeg_only_check.pack(
-            anchor="w",
-            fill="x",
-            pady=(2, 4),
-        )
-
         ttk.Label(
             sidebar,
-            text="Aparat: RAW (NEF) + JPEG na karcie SD",
+            text="RAW (NEF) + JPEG  •  karta SD + dysk",
             wraplength=300,
         ).pack(
             anchor="w",
@@ -1765,27 +1737,18 @@ class GPhotoGUI:
 
         self.controller.reset_capture_setup()
 
-        # Zapamiętujemy tryb na czas tego zdjęcia, żeby zmiana checkboxa
-        # w trakcie ekspozycji nie zmieniła zachowania po wykonaniu klatki.
-        self.current_capture_jpeg_only = bool(
-            self.laptop_jpeg_only_var.get()
-        )
-
         self.capture_button.config(
             state="disabled"
         )
-        self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
             "Robię zdjęcie RAW + JPEG..."
         )
 
-        # Pierwszy etap pobiera tylko JPEG. Ścieżkę RAW ustalamy tylko wtedy,
-        # gdy po JPEG ma nastąpić transfer NEF na laptop.
+        # Pierwszy etap pobiera tylko JPEG.
         future = self.executor.submit(
             self.controller.capture_photo,
             save_dir,
-            not self.current_capture_jpeg_only,
         )
 
         future.add_done_callback(
@@ -1804,7 +1767,6 @@ class GPhotoGUI:
             self.capture_button.config(
                 state="normal"
             )
-            self.laptop_jpeg_only_check.config(state="normal")
 
             self.status_var.set(
                 f"Błąd wykonywania zdjęcia: {exc}"
@@ -1833,15 +1795,6 @@ class GPhotoGUI:
                 f"JPEG zapisany, ale podgląd się nie udał: {exc}"
             )
 
-        if self.current_capture_jpeg_only:
-            self.capture_button.config(state="normal")
-            self.laptop_jpeg_only_check.config(state="normal")
-            self.status_var.set(
-                f"JPEG zapisany na laptopie: {result['jpeg'].name} • "
-                "RAW został na karcie SD"
-            )
-            return
-
         self.status_var.set(
             "JPEG gotowy • pobieram NEF w tle..."
         )
@@ -1865,7 +1818,6 @@ class GPhotoGUI:
         self.capture_button.config(
             state="normal"
         )
-        self.laptop_jpeg_only_check.config(state="normal")
 
         try:
             result = future.result()
@@ -1943,14 +1895,12 @@ class GPhotoGUI:
         self.series_done = 0
         self.series_interval = interval
         self.series_last_start = None
-        self.series_jpeg_only = bool(self.laptop_jpeg_only_var.get())
 
         self.series_start_button.config(state="disabled")
         self.series_stop_button.config(state="normal")
         self.capture_button.config(state="disabled")
         self.refresh_button.config(state="disabled")
         self.save_dir_button.config(state="disabled")
-        self.laptop_jpeg_only_check.config(state="disabled")
 
         self.series_progress_var.set(
             f"0 / {self.series_total}"
@@ -2029,7 +1979,6 @@ class GPhotoGUI:
         future = self.executor.submit(
             self.controller.capture_photo,
             self.series_save_dir,
-            not self.series_jpeg_only,
         )
 
         future.add_done_callback(
@@ -2076,11 +2025,6 @@ class GPhotoGUI:
             )
         except Exception:
             pass
-
-        if self.series_jpeg_only:
-            self.series_capture_in_progress = False
-            self._series_shot_finished(shot_number, jpeg_only=True)
-            return
 
         self.status_var.set(
             f"Seria {shot_number}/{self.series_total}: "
@@ -2130,11 +2074,7 @@ class GPhotoGUI:
                 )
             return
 
-        # Mamy JPG + NEF na dysku oraz oba pliki na karcie.
-        self._series_shot_finished(shot_number, jpeg_only=False)
-
-    def _series_shot_finished(self, shot_number, jpeg_only=False):
-        """Kończy obsługę jednej klatki i planuje następną."""
+        # Dopiero teraz mamy JPG + NEF na dysku oraz oba pliki na karcie.
         self.series_done = shot_number
 
         self.series_progress_var.set(
@@ -2156,8 +2096,8 @@ class GPhotoGUI:
             return
 
         # Interwał liczony jest od rozpoczęcia poprzedniej ekspozycji.
-        # W trybie JPEG-only nie czekamy na żaden transfer RAW, więc kolejna
-        # klatka może ruszyć zgodnie z zadanym interwałem dużo wcześniej.
+        # Jeśli transfer RAW trwa dłużej, następna klatka ruszy od razu,
+        # gdy aparat będzie ponownie dostępny.
         elapsed = 0.0
         if self.series_last_start is not None:
             elapsed = time.monotonic() - self.series_last_start
@@ -2167,9 +2107,8 @@ class GPhotoGUI:
             self.series_interval - elapsed,
         )
 
-        mode_text = "JPEG na laptopie; RAW na SD" if jpeg_only else "JPEG + RAW na laptopie"
         self.status_var.set(
-            f"Seria: {self.series_done}/{self.series_total}; {mode_text}; "
+            f"Seria: {self.series_done}/{self.series_total}; "
             f"następne za {wait_seconds:.1f} s"
         )
 
@@ -2215,7 +2154,6 @@ class GPhotoGUI:
             state="normal" if self.controller else "disabled"
         )
         self.save_dir_button.config(state="normal")
-        self.laptop_jpeg_only_check.config(state="normal")
 
     def test_completion_sound(self):
         """Ręczny test dźwięku z poziomu GUI."""
