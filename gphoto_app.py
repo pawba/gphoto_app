@@ -86,6 +86,13 @@ class GPhotoController:
                 "sudo apt install gphoto2"
             )
 
+        # Cache konfiguracji fotograficznej. Dzięki temu samo wyzwolenie
+        # migawki nie musi wykonywać --list-config ani ponownie odpytywać
+        # aparatu o te same ustawienia przed każdą klatką.
+        self._capture_setup_ready = False
+        self._capture_setup_fast_jpeg = None
+        self._config_paths_cache = []
+
     def run(self, *args, binary=False, timeout=30):
         cmd = [GPHOTO2, *args]
 
@@ -235,10 +242,12 @@ class GPhotoController:
             )
 
     def reset_capture_setup(self):
-        """
-        Wymusza ponowne sprawdzenie ustawień przed następnym zdjęciem/serią.
-        """
+        """Oznacza konfigurację fotografowania jako wymagającą odświeżenia."""
         self._capture_setup_ready = False
+        self._capture_setup_fast_jpeg = None
+
+    def set_config_paths_cache(self, config_paths):
+        self._config_paths_cache = list(config_paths or [])
 
     def _find_config_path(self, config_paths, candidate_names):
         candidates = {
@@ -314,22 +323,32 @@ class GPhotoController:
 
         return selected
 
-    def prepare_capture_setup(self):
+    def prepare_capture_setup(self, fast_jpeg=False, config_paths=None):
         """
-        Przed fotografowaniem:
-        1. ustaw zapis do karty pamięci,
-        2. ustaw RAW (NEF) + JPEG.
+        Przygotowuje aparat do zdjęć bez niepotrzebnego skanowania przed
+        każdą klatką. Dla trybu JPEG-only preferuje mały JPEG Basic,
+        podczas gdy RAW/NEF nadal pozostaje pełnym RAW-em na karcie.
+        """
+        fast_jpeg = bool(fast_jpeg)
 
-        Robimy to raz na pojedyncze zdjęcie albo raz na całą serię.
-        """
-        if getattr(self, "_capture_setup_ready", False):
+        if (
+            self._capture_setup_ready
+            and self._capture_setup_fast_jpeg == fast_jpeg
+        ):
             return
 
-        config_paths = self.list_config()
+        if config_paths is None:
+            config_paths = self._config_paths_cache
 
-        # Nikon/gPhoto2 często domyślnie używa "Internal RAM"
-        # podczas zdalnego fotografowania. Wymuszamy kartę pamięci,
-        # aby --keep rzeczywiście zostawiał kopię na SD.
+        if not config_paths:
+            # Fallback tylko wtedy, gdy nie mamy jeszcze cache (np. nietypowe
+            # uruchomienie kontrolera poza GUI). W normalnej pracy lista jest
+            # skanowana przy starcie oraz PO zdjęciu/serii.
+            config_paths = self.list_config()
+
+        self.set_config_paths_cache(config_paths)
+
+        # Zapis na kartę pamięci.
         self._set_choice_containing(
             config_paths,
             [
@@ -345,19 +364,7 @@ class GPhotoController:
             "miejsce zapisu = karta pamięci",
         )
 
-        # D5300 zapisuje RAW jako NEF. Szukamy opcji zawierającej
-        # jednocześnie RAW/NEF oraz JPEG/JPG.
         def raw_jpeg_choice(value):
-            """
-            Nikon/libgphoto2 często nazywa tryby RAW+JPEG jako:
-                NEF+Fine
-                NEF+Normal
-                NEF+Basic
-            bez użycia słowa "JPEG".
-
-            Obsługujemy zarówno takie nazwy, jak i warianty typu
-            "NEF (RAW) + JPEG Fine".
-            """
             raw_value = value.lower()
             normalized = (
                 raw_value
@@ -370,17 +377,14 @@ class GPhotoController:
                 "raw" in normalized
                 or "nef" in normalized
             )
-
             explicit_jpeg = (
                 "jpeg" in normalized
                 or "jpg" in normalized
             )
-
             has_quality_word = any(
                 quality in normalized
                 for quality in ("fine", "normal", "basic")
             )
-
             nikon_combined_mode = (
                 (
                     "nef+" in raw_value.replace(" ", "")
@@ -389,20 +393,25 @@ class GPhotoController:
                 and has_quality_word
             )
 
-            return has_raw and (
-                explicit_jpeg
-                or nikon_combined_mode
-            )
+            return has_raw and (explicit_jpeg or nikon_combined_mode)
 
         def quality_preference(value):
-            # Jeśli aparat ma kilka wariantów RAW+JPEG,
-            # preferujemy JPEG Fine.
-            if "fine" in value:
-                return 30
-            if "normal" in value:
-                return 20
-            if "basic" in value:
-                return 10
+            # JPEG-only: najmniejszy transfer -> Basic.
+            # Pełny zapis na laptop: zachowujemy Fine jako preferencję.
+            if fast_jpeg:
+                if "basic" in value:
+                    return 30
+                if "normal" in value:
+                    return 20
+                if "fine" in value:
+                    return 10
+            else:
+                if "fine" in value:
+                    return 30
+                if "normal" in value:
+                    return 20
+                if "basic" in value:
+                    return 10
             return 0
 
         self._set_choice_containing(
@@ -419,9 +428,76 @@ class GPhotoController:
             prefer=quality_preference,
         )
 
-        self._capture_setup_ready = True
+        # Jeśli aparat udostępnia osobny rozmiar JPEG, w szybkim trybie
+        # wybieramy najmniejszy (S / Small / najmniejsza rozdzielczość).
+        # Brak tej opcji nie jest błędem — wtedy samo Basic nadal przyspiesza.
+        def jpeg_size_preference(value):
+            normalized = value.strip().lower()
+            compact = normalized.replace(" ", "")
 
-    def capture_photo(self, save_dir, need_raw_path=True):
+            word_score = 0
+            if any(token in normalized for token in ("small", " mały", "maly")):
+                word_score = 300
+            elif normalized in {"s", "small"} or compact.startswith("s("):
+                word_score = 300
+            elif "medium" in normalized or normalized in {"m", "medium"}:
+                word_score = 200
+            elif "large" in normalized or normalized in {"l", "large"}:
+                word_score = 100
+
+            dim_match = re.search(r"(\d{3,5})\s*[x×]\s*(\d{3,5})", normalized)
+            area = None
+            if dim_match:
+                area = int(dim_match.group(1)) * int(dim_match.group(2))
+
+            if fast_jpeg:
+                if word_score:
+                    return word_score * 10**9 - (area or 0)
+                if area is not None:
+                    return 10**15 - area
+                return 0
+
+            # Po wyłączeniu szybkiego JPEG wracamy do największego rozmiaru.
+            if area is not None:
+                return area
+            return {100: 300, 200: 200, 300: 100}.get(word_score, 0)
+
+        try:
+            self._set_choice_containing(
+                config_paths,
+                [
+                    "imagesize",
+                    "imagesize2",
+                    "image-size",
+                    "image_size",
+                    "jpegsize",
+                    "jpeg-size",
+                ],
+                lambda value: True,
+                "rozmiar JPEG",
+                prefer=jpeg_size_preference,
+            )
+        except GPhotoError:
+            pass
+
+        self._capture_setup_ready = True
+        self._capture_setup_fast_jpeg = fast_jpeg
+
+    def scan_and_prepare_capture_setup(self, fast_jpeg=False):
+        """
+        Pełne skanowanie wykonujemy poza sekwencją robienia klatek:
+        po pojedynczym zdjęciu, po serii albo po zmianie trybu JPEG.
+        """
+        config_paths = self.list_config()
+        self.set_config_paths_cache(config_paths)
+        self.reset_capture_setup()
+        self.prepare_capture_setup(
+            fast_jpeg=fast_jpeg,
+            config_paths=config_paths,
+        )
+        return config_paths
+
+    def capture_photo(self, save_dir, need_raw_path=True, fast_jpeg=False):
         """
         Etap 1:
         - wykonuje zdjęcie w trybie NEF+JPEG,
@@ -438,7 +514,7 @@ class GPhotoController:
             exist_ok=True,
         )
 
-        self.prepare_capture_setup()
+        self.prepare_capture_setup(fast_jpeg=fast_jpeg)
 
         stamp = datetime.now().strftime(
             "%Y-%m-%d_%H-%M-%S_%f"
@@ -1176,8 +1252,9 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="Na laptop tylko JPEG (RAW zostaje na karcie SD)",
+            text="Na laptop szybki JPEG (Basic/S); RAW zostaje na SD",
             variable=self.laptop_jpeg_only_var,
+            command=self.on_laptop_jpeg_only_changed,
         )
         self.laptop_jpeg_only_check.pack(
             anchor="w",
@@ -1398,6 +1475,14 @@ class GPhotoGUI:
 
         detect_output = controller.autodetect()
         config_paths = controller.list_config()
+        controller.set_config_paths_cache(config_paths)
+
+        # Jednorazowo przygotowujemy aparat przy starcie. Dzięki temu pierwsze
+        # zdjęcie nie zaczyna się od skanowania konfiguracji.
+        controller.prepare_capture_setup(
+            fast_jpeg=False,
+            config_paths=config_paths,
+        )
 
         return (
             controller,
@@ -1606,6 +1691,7 @@ class GPhotoGUI:
     def _refresh_done(self, future):
         try:
             self.config_paths = future.result()
+            self.controller.set_config_paths_cache(self.config_paths)
 
         except Exception as exc:
             self.status_var.set(
@@ -1746,6 +1832,156 @@ class GPhotoGUI:
             self.request_live_frame,
         )
 
+    def on_laptop_jpeg_only_changed(self):
+        """Przygotowuje nowy tryb od razu po zmianie checkboxa, nie przy zdjęciu."""
+        if not self.controller or self.series_running:
+            return
+
+        fast_jpeg = bool(self.laptop_jpeg_only_var.get())
+        self.capture_button.config(state="disabled")
+        self.series_start_button.config(state="disabled")
+        self.refresh_button.config(state="disabled")
+        self.laptop_jpeg_only_check.config(state="disabled")
+
+        self.status_var.set(
+            "Ustawiam szybki JPEG Basic/S..."
+            if fast_jpeg
+            else "Przywracam JPEG Fine/duży..."
+        )
+
+        future = self.executor.submit(
+            self.controller.scan_and_prepare_capture_setup,
+            fast_jpeg,
+        )
+        future.add_done_callback(
+            lambda f: self.root.after(
+                0,
+                self._capture_mode_prepare_done,
+                f,
+                fast_jpeg,
+            )
+        )
+
+    def _capture_mode_prepare_done(self, future, fast_jpeg):
+        try:
+            self.config_paths = future.result()
+        except Exception as exc:
+            self.status_var.set(f"Błąd ustawiania trybu JPEG: {exc}")
+            messagebox.showerror("Ustawienia JPEG", str(exc))
+        else:
+            self.status_var.set(
+                "Tryb gotowy: szybki JPEG Basic/S na laptop, RAW na SD"
+                if fast_jpeg
+                else "Tryb gotowy: JPEG Fine + RAW"
+            )
+        finally:
+            if not self.closing and not self.series_running:
+                self.capture_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.series_start_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.refresh_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.laptop_jpeg_only_check.config(state="normal")
+
+    def _scan_after_single_capture(self, final_status):
+        """Skanuje i przygotowuje aparat dopiero PO pojedynczym zdjęciu."""
+        if self.closing or not self.controller:
+            return
+
+
+        fast_jpeg = self.current_capture_jpeg_only
+        self.status_var.set(final_status + " • sprawdzam ustawienia na następne zdjęcie...")
+
+        future = self.executor.submit(
+            self.controller.scan_and_prepare_capture_setup,
+            fast_jpeg,
+        )
+        future.add_done_callback(
+            lambda f: self.root.after(
+                0,
+                self._scan_after_single_done,
+                f,
+                final_status,
+            )
+        )
+
+    def _scan_after_single_done(self, future, final_status):
+        try:
+            self.config_paths = future.result()
+        except Exception as exc:
+            self.status_var.set(
+                final_status + f" • błąd skanowania ustawień: {exc}"
+            )
+        else:
+            self.status_var.set(final_status)
+        finally:
+            if not self.closing:
+                self.capture_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.series_start_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.refresh_button.config(
+                    state="normal" if self.controller else "disabled"
+                )
+                self.laptop_jpeg_only_check.config(state="normal")
+
+    def _scan_after_series(self, final_status, progress_status=None, play_sound=False):
+        """Skanuje aparat raz po zakończeniu/zatrzymaniu całej serii."""
+        if self.closing or not self.controller:
+            self._restore_after_series()
+            return
+
+        self.series_capture_in_progress = False
+        self.status_var.set(final_status + " • sprawdzam ustawienia...")
+        if progress_status is not None:
+            self.series_progress_var.set(progress_status)
+
+        fast_jpeg = self.series_jpeg_only
+        future = self.executor.submit(
+            self.controller.scan_and_prepare_capture_setup,
+            fast_jpeg,
+        )
+        future.add_done_callback(
+            lambda f: self.root.after(
+                0,
+                self._scan_after_series_done,
+                f,
+                final_status,
+                progress_status,
+                play_sound,
+            )
+        )
+
+    def _scan_after_series_done(
+        self,
+        future,
+        final_status,
+        progress_status,
+        play_sound,
+    ):
+        try:
+            self.config_paths = future.result()
+        except Exception as exc:
+            self.status_var.set(
+                final_status + f" • błąd skanowania ustawień: {exc}"
+            )
+        else:
+            self.status_var.set(final_status)
+
+        if progress_status is not None:
+            self.series_progress_var.set(progress_status)
+
+        self._restore_after_series()
+
+        if play_sound:
+            self.play_completion_sound()
+
     # --------------------------------------------------------
     # CAPTURE
     # --------------------------------------------------------
@@ -1763,8 +1999,6 @@ class GPhotoGUI:
             )
             return
 
-        self.controller.reset_capture_setup()
-
         # Zapamiętujemy tryb na czas tego zdjęcia, żeby zmiana checkboxa
         # w trakcie ekspozycji nie zmieniła zachowania po wykonaniu klatki.
         self.current_capture_jpeg_only = bool(
@@ -1774,6 +2008,8 @@ class GPhotoGUI:
         self.capture_button.config(
             state="disabled"
         )
+        self.series_start_button.config(state="disabled")
+        self.refresh_button.config(state="disabled")
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
@@ -1786,6 +2022,7 @@ class GPhotoGUI:
             self.controller.capture_photo,
             save_dir,
             not self.current_capture_jpeg_only,
+            self.current_capture_jpeg_only,
         )
 
         future.add_done_callback(
@@ -1803,6 +2040,12 @@ class GPhotoGUI:
         except Exception as exc:
             self.capture_button.config(
                 state="normal"
+            )
+            self.series_start_button.config(
+                state="normal" if self.controller else "disabled"
+            )
+            self.refresh_button.config(
+                state="normal" if self.controller else "disabled"
             )
             self.laptop_jpeg_only_check.config(state="normal")
 
@@ -1834,12 +2077,11 @@ class GPhotoGUI:
             )
 
         if self.current_capture_jpeg_only:
-            self.capture_button.config(state="normal")
-            self.laptop_jpeg_only_check.config(state="normal")
-            self.status_var.set(
+            final_status = (
                 f"JPEG zapisany na laptopie: {result['jpeg'].name} • "
                 "RAW został na karcie SD"
             )
+            self._scan_after_single_capture(final_status)
             return
 
         self.status_var.set(
@@ -1862,29 +2104,23 @@ class GPhotoGUI:
         )
 
     def capture_raw_done(self, future):
-        self.capture_button.config(
-            state="normal"
-        )
-        self.laptop_jpeg_only_check.config(state="normal")
-
         try:
             result = future.result()
 
         except Exception as exc:
-            self.status_var.set(
-                f"JPEG zapisany; błąd pobierania RAW: {exc}"
-            )
-
+            final_status = f"JPEG zapisany; błąd pobierania RAW: {exc}"
             messagebox.showerror(
                 "Błąd pobierania RAW",
                 str(exc),
             )
+            self._scan_after_single_capture(final_status)
             return
 
-        self.status_var.set(
+        final_status = (
             "Zapisano na dysku i karcie: "
             f"{result['jpeg'].name} + {result['raw'].name}"
         )
+        self._scan_after_single_capture(final_status)
 
     # --------------------------------------------------------
     # SERIA / TIMELAPSE
@@ -1928,9 +2164,8 @@ class GPhotoGUI:
             )
             return
 
-        # Przed każdą nową serią ponownie wymuszamy:
-        # karta pamięci + RAW/JPEG.
-        self.controller.reset_capture_setup()
+        # Konfiguracja została przygotowana wcześniej (przy starcie aplikacji
+        # albo przy zmianie trybu JPEG). W samej serii nie skanujemy ustawień.
 
         # Live View stale odpytuje aparat. Podczas serii wyłączamy go,
         # aby polecenia nie konkurowały ze sobą o połączenie USB.
@@ -1992,12 +2227,16 @@ class GPhotoGUI:
                 f"Zatrzymywanie… {self.series_done} / {self.series_total}"
             )
         else:
-            self._restore_after_series()
-            self.status_var.set(
+            final_status = (
                 f"Seria zatrzymana: {self.series_done} / {self.series_total}"
             )
-            self.series_progress_var.set(
+            progress_status = (
                 f"Zatrzymano: {self.series_done} / {self.series_total}"
+            )
+            self._scan_after_series(
+                final_status,
+                progress_status,
+                play_sound=False,
             )
 
     def _series_capture_next(self):
@@ -2030,6 +2269,7 @@ class GPhotoGUI:
             self.controller.capture_photo,
             self.series_save_dir,
             not self.series_jpeg_only,
+            self.series_jpeg_only,
         )
 
         future.add_done_callback(
@@ -2049,20 +2289,21 @@ class GPhotoGUI:
             self.series_capture_in_progress = False
             was_running = self.series_running
             self.series_running = False
-            self._restore_after_series()
 
-            self.status_var.set(
-                f"Błąd serii przy zdjęciu {shot_number}: {exc}"
-            )
-            self.series_progress_var.set(
-                f"Błąd przy {shot_number}/{self.series_total}"
-            )
+            final_status = f"Błąd serii przy zdjęciu {shot_number}: {exc}"
+            progress_status = f"Błąd przy {shot_number}/{self.series_total}"
 
             if was_running:
                 messagebox.showerror(
                     "Błąd serii",
                     str(exc),
                 )
+
+            self._scan_after_series(
+                final_status,
+                progress_status,
+                play_sound=False,
+            )
             return
 
         # JPEG jest już dostępny — aktualizujemy podgląd przed RAW-em.
@@ -2114,20 +2355,23 @@ class GPhotoGUI:
         except Exception as exc:
             was_running = self.series_running
             self.series_running = False
-            self._restore_after_series()
 
-            self.status_var.set(
+            final_status = (
                 f"JPEG zapisany, ale błąd RAW przy {shot_number}: {exc}"
             )
-            self.series_progress_var.set(
-                f"Błąd RAW przy {shot_number}/{self.series_total}"
-            )
+            progress_status = f"Błąd RAW przy {shot_number}/{self.series_total}"
 
             if was_running:
                 messagebox.showerror(
                     "Błąd pobierania RAW",
                     str(exc),
                 )
+
+            self._scan_after_series(
+                final_status,
+                progress_status,
+                play_sound=False,
+            )
             return
 
         # Mamy JPG + NEF na dysku oraz oba pliki na karcie.
@@ -2142,12 +2386,16 @@ class GPhotoGUI:
         )
 
         if not self.series_running:
-            self._restore_after_series()
-            self.status_var.set(
+            final_status = (
                 f"Seria zatrzymana: {self.series_done} / {self.series_total}"
             )
-            self.series_progress_var.set(
+            progress_status = (
                 f"Zatrzymano: {self.series_done} / {self.series_total}"
+            )
+            self._scan_after_series(
+                final_status,
+                progress_status,
+                play_sound=False,
             )
             return
 
@@ -2189,16 +2437,20 @@ class GPhotoGUI:
                 pass
             self.series_after_id = None
 
-        self._restore_after_series()
-
-        self.status_var.set(
+        final_status = (
             f"Seria zakończona: {self.series_done}/{self.series_total}"
         )
-        self.series_progress_var.set(
+        progress_status = (
             f"✓ Gotowe: {self.series_done} / {self.series_total}"
         )
 
         self.play_completion_sound()
+
+        self._scan_after_series(
+            final_status,
+            progress_status,
+            play_sound=False,
+        )
 
     def _restore_after_series(self):
         if self.closing:
