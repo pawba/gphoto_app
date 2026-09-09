@@ -140,8 +140,8 @@ class GPhotoController:
     def autodetect(self):
         return self.run("--auto-detect")
 
-    def list_config(self):
-        text = self.run("--list-config")
+    def list_config(self, timeout=30):
+        text = self.run("--list-config", timeout=timeout)
 
         return [
             line.strip()
@@ -571,16 +571,35 @@ class GPhotoController:
 
     def scan_and_prepare_capture_setup(self, fast_jpeg=False):
         """
-        Pełne skanowanie wykonujemy poza sekwencją robienia klatek:
-        po pojedynczym zdjęciu, po serii albo po zmianie trybu JPEG.
+        Lekki skan po zdjęciu/serii.
+
+        Poprzednio ta funkcja po każdym skanie resetowała cache i ponownie
+        wykonywała kilka osobnych poleceń gphoto2 (--get-config/--set-config).
+        Na Nikonach każde takie uruchomienie otwiera nową sesję PTP i może
+        trwać długo.
+
+        Teraz zawsze robimy tylko jedno --list-config. Pełne przygotowanie
+        aparatu uruchamiamy wyłącznie wtedy, gdy tryb JPEG faktycznie się
+        zmienił albo konfiguracja nie była jeszcze przygotowana.
         """
-        config_paths = self.list_config()
+        fast_jpeg = bool(fast_jpeg)
+        # Skan po zdjęciu nie może blokować aplikacji przez dziesiątki sekund.
+        # Pełny skan przy starcie nadal ma standardowy limit; tutaj maks. 8 s.
+        config_paths = self.list_config(timeout=8)
         self.set_config_paths_cache(config_paths)
-        self.reset_capture_setup()
-        self.prepare_capture_setup(
-            fast_jpeg=fast_jpeg,
-            config_paths=config_paths,
+
+        needs_prepare = not (
+            self._capture_setup_ready
+            and self._capture_setup_fast_jpeg == fast_jpeg
         )
+
+        if needs_prepare:
+            self.reset_capture_setup()
+            self.prepare_capture_setup(
+                fast_jpeg=fast_jpeg,
+                config_paths=config_paths,
+            )
+
         return config_paths
 
     def capture_photo(self, save_dir, need_raw_path=True, fast_jpeg=False):
@@ -625,10 +644,15 @@ class GPhotoController:
             # W trybie pełnym nadal zachowujemy pliki na karcie.
             capture_args.extend(["--keep", "--keep-raw"])
 
+        capture_started = time.monotonic()
+        # W trybie JPEG-only nie akceptujemy minutowego zawieszenia PTP.
+        # Normalny mały JPEG powinien wrócić dużo wcześniej.
+        capture_timeout = 20 if not need_raw_path else 120
         output = self.run(
             *capture_args,
-            timeout=120,
+            timeout=capture_timeout,
         )
+        capture_seconds = time.monotonic() - capture_started
 
         # Lokalnie powinien być już JPEG.
         files = sorted(
@@ -679,6 +703,7 @@ class GPhotoController:
                 "raw": None,
                 "raw_camera_folder": None,
                 "raw_camera_name": None,
+                "capture_seconds": capture_seconds,
             }
 
         # gphoto2 z --keep-raw wypisuje lokalizację NEF na aparacie,
@@ -713,6 +738,7 @@ class GPhotoController:
             "raw": raw_local_path,
             "raw_camera_folder": raw_camera_folder,
             "raw_camera_name": raw_camera_name,
+            "capture_seconds": capture_seconds,
         }
 
     def download_raw(self, capture_result):
@@ -956,7 +982,7 @@ class GPhotoGUI:
     def __init__(self, root):
         self.root = root
 
-        self.root.title("gphoto2 Camera Control")
+        self.root.title("gphoto2 Camera Control — fast JPEG v6")
         self.root.geometry("1200x760")
         self.root.minsize(850, 600)
 
@@ -966,6 +992,7 @@ class GPhotoGUI:
         )
 
         self.live_enabled = False
+        self.resume_live_after_capture = False
         self.closing = False
 
         # Jeden duży panel obrazu zamiast dwóch mniejszych.
@@ -2061,6 +2088,7 @@ class GPhotoGUI:
                     state="normal" if self.controller else "disabled"
                 )
                 self.laptop_jpeg_only_check.config(state="normal")
+            self._resume_live_after_single_capture()
 
     def _scan_after_series(self, final_status, progress_status=None, play_sound=False):
         """Skanuje aparat raz po zakończeniu/zatrzymaniu całej serii."""
@@ -2113,6 +2141,19 @@ class GPhotoGUI:
         if play_sound:
             self.play_completion_sound()
 
+    def _resume_live_after_single_capture(self):
+        if (
+            self.resume_live_after_capture
+            and not self.closing
+            and self.controller
+            and not self.series_running
+            and not self.live_enabled
+        ):
+            self.resume_live_after_capture = False
+            self.toggle_live()
+        else:
+            self.resume_live_after_capture = False
+
     # --------------------------------------------------------
     # CAPTURE
     # --------------------------------------------------------
@@ -2135,6 +2176,13 @@ class GPhotoGUI:
         self.current_capture_jpeg_only = bool(
             self.laptop_jpeg_only_var.get()
         )
+
+        # Nikon D5300 potrafi wyraźnie zwalniać fotografowanie w Live View.
+        # Zatrzymujemy Live View przed właściwym poleceniem capture, a po
+        # zakończeniu zdjęcia uruchamiamy go ponownie, jeśli był włączony.
+        self.resume_live_after_capture = bool(self.live_enabled)
+        if self.live_enabled:
+            self.toggle_live()
 
         self.capture_button.config(
             state="disabled"
@@ -2188,6 +2236,7 @@ class GPhotoGUI:
                 "Błąd aparatu",
                 str(exc),
             )
+            self._resume_live_after_single_capture()
             return
 
         # JPEG jest już na dysku — pokazujemy go NATYCHMIAST,
@@ -2213,9 +2262,23 @@ class GPhotoGUI:
                 jpeg_info = f"{jpeg_mb:.1f} MB"
             except OSError:
                 jpeg_info = "rozmiar nieznany"
+
+            try:
+                with Image.open(result["jpeg"]) as info_image:
+                    jpeg_dims = f"{info_image.width}×{info_image.height}"
+            except Exception:
+                jpeg_dims = "?×?"
+
+            capture_seconds = result.get("capture_seconds")
+            time_info = (
+                f" • capture+USB {capture_seconds:.1f} s"
+                if isinstance(capture_seconds, (int, float))
+                else ""
+            )
+
             final_status = (
-                f"JPEG zapisany na laptopie: {result['jpeg'].name} ({jpeg_info}) • "
-                "RAW został wyłącznie na karcie SD"
+                f"JPEG: {result['jpeg'].name} • {jpeg_dims} • {jpeg_info}"
+                f"{time_info} • RAW tylko na karcie SD"
             )
             self._scan_after_single_capture(final_status)
             return
@@ -2456,6 +2519,11 @@ class GPhotoGUI:
 
         if self.series_jpeg_only:
             self.series_capture_in_progress = False
+            capture_seconds = result.get("capture_seconds")
+            if isinstance(capture_seconds, (int, float)):
+                self.status_var.set(
+                    f"Seria {shot_number}/{self.series_total}: JPEG gotowy w {capture_seconds:.1f} s • RAW tylko SD"
+                )
             self._series_shot_finished(shot_number, jpeg_only=True)
             return
 
