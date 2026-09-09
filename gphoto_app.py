@@ -93,6 +93,12 @@ class GPhotoController:
         self._capture_setup_fast_jpeg = None
         self._config_paths_cache = []
 
+        # Zapamiętujemy normalny rozmiar JPEG, żeby tryb szybki nie
+        # wymuszał potem dużego JPEG-a ani nie zmieniał ustawienia na stałe.
+        self._normal_jpeg_size = None
+        self._capture_setup_quality = None
+        self._capture_setup_jpeg_size = None
+
     def run(self, *args, binary=False, timeout=30):
         cmd = [GPHOTO2, *args]
 
@@ -326,8 +332,18 @@ class GPhotoController:
     def prepare_capture_setup(self, fast_jpeg=False, config_paths=None):
         """
         Przygotowuje aparat do zdjęć bez niepotrzebnego skanowania przed
-        każdą klatką. Dla trybu JPEG-only preferuje mały JPEG Basic,
-        podczas gdy RAW/NEF nadal pozostaje pełnym RAW-em na karcie.
+        każdą klatką.
+
+        fast_jpeg=False:
+            - RAW + JPEG Fine,
+            - NIE zmieniamy rozmiaru JPEG; zostaje taki, jak ustawiony
+              w aparacie przez użytkownika.
+
+        fast_jpeg=True:
+            - RAW + JPEG Basic,
+            - jeśli aparat udostępnia osobne ustawienie rozmiaru JPEG,
+              wybieramy najmniejszy dostępny rozmiar,
+            - RAW/NEF nie jest zmniejszany.
         """
         fast_jpeg = bool(fast_jpeg)
 
@@ -341,9 +357,6 @@ class GPhotoController:
             config_paths = self._config_paths_cache
 
         if not config_paths:
-            # Fallback tylko wtedy, gdy nie mamy jeszcze cache (np. nietypowe
-            # uruchomienie kontrolera poza GUI). W normalnej pracy lista jest
-            # skanowana przy starcie oraz PO zdjęciu/serii.
             config_paths = self.list_config()
 
         self.set_config_paths_cache(config_paths)
@@ -396,8 +409,7 @@ class GPhotoController:
             return has_raw and (explicit_jpeg or nikon_combined_mode)
 
         def quality_preference(value):
-            # JPEG-only: najmniejszy transfer -> Basic.
-            # Pełny zapis na laptop: zachowujemy Fine jako preferencję.
+            # W szybkim trybie najpierw Basic; w normalnym Fine.
             if fast_jpeg:
                 if "basic" in value:
                     return 30
@@ -414,7 +426,7 @@ class GPhotoController:
                     return 10
             return 0
 
-        self._set_choice_containing(
+        self._capture_setup_quality = self._set_choice_containing(
             config_paths,
             [
                 "imagequality",
@@ -428,57 +440,108 @@ class GPhotoController:
             prefer=quality_preference,
         )
 
-        # Jeśli aparat udostępnia osobny rozmiar JPEG, w szybkim trybie
-        # wybieramy najmniejszy (S / Small / najmniejsza rozdzielczość).
-        # Brak tej opcji nie jest błędem — wtedy samo Basic nadal przyspiesza.
-        def jpeg_size_preference(value):
-            normalized = value.strip().lower()
-            compact = normalized.replace(" ", "")
+        # Znajdź ustawienie rozmiaru JPEG. Nie bierzemy ścieżek RAW/NEF.
+        size_candidates = [
+            "imagesize",
+            "imagesize2",
+            "image-size",
+            "image_size",
+            "jpegsize",
+            "jpeg-size",
+            "jpeg_size",
+            "jpegimagesize",
+            "jpeg-image-size",
+            "jpeg_image_size",
+        ]
 
-            word_score = 0
-            if any(token in normalized for token in ("small", " mały", "maly")):
-                word_score = 300
-            elif normalized in {"s", "small"} or compact.startswith("s("):
-                word_score = 300
-            elif "medium" in normalized or normalized in {"m", "medium"}:
-                word_score = 200
-            elif "large" in normalized or normalized in {"l", "large"}:
-                word_score = 100
+        size_path = self._find_config_path(config_paths, size_candidates)
+        if not size_path:
+            for path in config_paths:
+                leaf = path.rstrip("/").split("/")[-1].lower()
+                compact = leaf.replace("-", "").replace("_", "")
+                if "raw" in compact or "nef" in compact:
+                    continue
+                if "imagesize" in compact or ("jpeg" in compact and "size" in compact):
+                    size_path = path
+                    break
 
-            dim_match = re.search(r"(\d{3,5})\s*[x×]\s*(\d{3,5})", normalized)
-            area = None
-            if dim_match:
-                area = int(dim_match.group(1)) * int(dim_match.group(2))
+        self._capture_setup_jpeg_size = None
 
-            if fast_jpeg:
-                if word_score:
-                    return word_score * 10**9 - (area or 0)
-                if area is not None:
-                    return 10**15 - area
-                return 0
+        if size_path:
+            try:
+                size_config = self.get_config(size_path)
+                current_size = size_config.get("current")
+                choices = [value for _, value in size_config.get("choices", [])]
 
-            # Po wyłączeniu szybkiego JPEG wracamy do największego rozmiaru.
-            if area is not None:
-                return area
-            return {100: 300, 200: 200, 300: 100}.get(word_score, 0)
+                # W trybie normalnym zapamiętujemy rozmiar zastany przy starcie.
+                # Po wyjściu z szybkiego JPEG przywracamy właśnie ten rozmiar,
+                # a nie wymuszamy Large.
+                if not fast_jpeg:
+                    if self._normal_jpeg_size is None and current_size:
+                        self._normal_jpeg_size = current_size
 
-        try:
-            self._set_choice_containing(
-                config_paths,
-                [
-                    "imagesize",
-                    "imagesize2",
-                    "image-size",
-                    "image_size",
-                    "jpegsize",
-                    "jpeg-size",
-                ],
-                lambda value: True,
-                "rozmiar JPEG",
-                prefer=jpeg_size_preference,
-            )
-        except GPhotoError:
-            pass
+                    target_size = self._normal_jpeg_size or current_size
+                    if target_size and choices and target_size in choices:
+                        if current_size != target_size:
+                            self.set_config(size_path, target_size)
+                        self._capture_setup_jpeg_size = target_size
+                    else:
+                        self._capture_setup_jpeg_size = current_size
+
+                elif choices:
+                    # Jeśli nie mamy jeszcze zapamiętanego normalnego rozmiaru,
+                    # zachowujemy go przed przełączeniem na najmniejszy JPEG.
+                    if self._normal_jpeg_size is None and current_size:
+                        self._normal_jpeg_size = current_size
+
+                    def size_key(value):
+                        s = value.strip().lower()
+                        compact = re.sub(r"\s+", "", s)
+
+                        # Najpierw jawne oznaczenia S/M/L.
+                        semantic = 3
+                        if (
+                            "small" in s
+                            or "mały" in s
+                            or "maly" in s
+                            or re.match(r"^s(?:$|[\s(\[/_-])", s)
+                        ):
+                            semantic = 0
+                        elif (
+                            "medium" in s
+                            or "średni" in s
+                            or "sredni" in s
+                            or re.match(r"^m(?:$|[\s(\[/_-])", s)
+                        ):
+                            semantic = 1
+                        elif (
+                            "large" in s
+                            or "duży" in s
+                            or "duzy" in s
+                            or re.match(r"^l(?:$|[\s(\[/_-])", s)
+                        ):
+                            semantic = 2
+
+                        # Następnie faktyczna liczba pikseli, jeśli jest w nazwie.
+                        area = float("inf")
+                        dim_match = re.search(r"(\d{3,5})\s*[x×]\s*(\d{3,5})", s)
+                        if dim_match:
+                            area = int(dim_match.group(1)) * int(dim_match.group(2))
+                        else:
+                            mp_match = re.search(r"(\d+(?:[.,]\d+)?)\s*mp", compact)
+                            if mp_match:
+                                area = float(mp_match.group(1).replace(",", ".")) * 1_000_000
+
+                        return (semantic, area, len(value))
+
+                    selected_size = min(choices, key=size_key)
+                    if current_size != selected_size:
+                        self.set_config(size_path, selected_size)
+                    self._capture_setup_jpeg_size = selected_size
+
+            except GPhotoError:
+                # Basic nadal działa. Nie twierdzimy jednak w GUI, że mamy S.
+                self._capture_setup_jpeg_size = None
 
         self._capture_setup_ready = True
         self._capture_setup_fast_jpeg = fast_jpeg
@@ -1252,7 +1315,7 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="Na laptop szybki JPEG (Basic/S); RAW zostaje na SD",
+            text="Na laptop szybki JPEG; RAW zostaje na SD",
             variable=self.laptop_jpeg_only_var,
             command=self.on_laptop_jpeg_only_changed,
         )
@@ -1844,9 +1907,9 @@ class GPhotoGUI:
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
-            "Ustawiam szybki JPEG Basic/S..."
+            "Ustawiam szybki JPEG (Basic + najmniejszy dostępny rozmiar)..."
             if fast_jpeg
-            else "Przywracam JPEG Fine/duży..."
+            else "Przywracam JPEG Fine i poprzedni rozmiar..."
         )
 
         future = self.executor.submit(
@@ -1869,11 +1932,21 @@ class GPhotoGUI:
             self.status_var.set(f"Błąd ustawiania trybu JPEG: {exc}")
             messagebox.showerror("Ustawienia JPEG", str(exc))
         else:
-            self.status_var.set(
-                "Tryb gotowy: szybki JPEG Basic/S na laptop, RAW na SD"
-                if fast_jpeg
-                else "Tryb gotowy: JPEG Fine + RAW"
-            )
+            if fast_jpeg:
+                quality = self.controller._capture_setup_quality or "JPEG Basic"
+                jpeg_size = self.controller._capture_setup_jpeg_size
+                if jpeg_size:
+                    self.status_var.set(
+                        f"Tryb gotowy: {quality}; JPEG {jpeg_size} na laptop, RAW na SD"
+                    )
+                else:
+                    self.status_var.set(
+                        f"Tryb gotowy: {quality}; rozmiaru JPEG aparat nie udostępnił, RAW na SD"
+                    )
+            else:
+                self.status_var.set(
+                    "Tryb gotowy: JPEG Fine + RAW; przywrócono normalny rozmiar JPEG"
+                )
         finally:
             if not self.closing and not self.series_running:
                 self.capture_button.config(
