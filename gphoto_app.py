@@ -340,10 +340,9 @@ class GPhotoController:
               w aparacie przez użytkownika.
 
         fast_jpeg=True:
-            - RAW + JPEG Basic,
-            - jeśli aparat udostępnia osobne ustawienie rozmiaru JPEG,
-              wybieramy najmniejszy dostępny rozmiar,
-            - RAW/NEF nie jest zmniejszany.
+            - aparat zapisuje tylko pełny RAW/NEF na kartę SD,
+            - na laptop pobierana jest tylko mała miniatura RAW jako JPG proxy,
+            - pełny RAW nie przechodzi przez USB.
         """
         fast_jpeg = bool(fast_jpeg)
 
@@ -433,6 +432,37 @@ class GPhotoController:
             "imageformat",
             "image-format",
         ]
+
+        if fast_jpeg:
+            # Najszybszy tryb: aparat zapisuje TYLKO pełny RAW na karcie.
+            # Na laptop pobierzemy potem małą miniaturę tego RAW-a jako JPG.
+            # Nie tworzymy pełnego JPEG-a w aparacie, więc nie ma 9 MB do USB.
+            def raw_only_choice(value):
+                normalized = (
+                    value.lower()
+                    .replace(" ", "")
+                    .replace("_", "")
+                    .replace("-", "")
+                )
+                has_raw = "raw" in normalized or "nef" in normalized
+                has_jpeg = "jpeg" in normalized or "jpg" in normalized
+                has_combo_quality = any(
+                    q in normalized for q in ("fine", "normal", "basic")
+                )
+                return has_raw and not has_jpeg and not has_combo_quality
+
+            self._capture_setup_quality = self._set_choice_containing(
+                config_paths,
+                quality_candidates,
+                raw_only_choice,
+                "format RAW (NEF) bez JPEG",
+            )
+
+            self._capture_setup_jpeg_size = "proxy z miniatury RAW"
+            self._capture_setup_ready = True
+            self._capture_setup_fast_jpeg = fast_jpeg
+            return
+
         self._capture_setup_quality = self._set_choice_containing(
             config_paths,
             quality_candidates,
@@ -440,12 +470,6 @@ class GPhotoController:
             "format RAW (NEF) + JPEG",
             prefer=quality_preference,
         )
-
-        if fast_jpeg and "basic" not in self._capture_setup_quality.lower():
-            raise GPhotoError(
-                "Aparat nie przyjął trybu NEF + JPEG Basic. "
-                f"Aktualnie wybrano: {self._capture_setup_quality}"
-            )
 
         # Znajdź ustawienie rozmiaru JPEG. Nie bierzemy ścieżek RAW/NEF.
         size_candidates = [
@@ -604,135 +628,157 @@ class GPhotoController:
 
     def capture_photo(self, save_dir, need_raw_path=True, fast_jpeg=False):
         """
-        Etap 1:
-        - wykonuje zdjęcie w trybie NEF+JPEG,
-        - wykonuje RAW+JPEG,
-        - w trybie JPEG-only RAW zostaje na karcie SD,
-        - na komputer pobiera wyłącznie JPEG.
+        Fotografowanie.
 
-        Dzięki --keep-raw JPEG jest dostępny do podglądu znacznie wcześniej.
-        NEF jest pobierany osobno przez download_raw(), ale tylko gdy GUI
-        rzeczywiście chce zapisać RAW także na laptopie.
+        fast_jpeg / JPG proxy:
+            1. aparat zapisuje TYLKO pełny NEF na karcie SD,
+            2. pobieramy z aparatu wyłącznie miniaturę tego NEF-a,
+            3. miniaturę zapisujemy na laptopie jako JPG proxy.
+
+        Dzięki temu przez USB nie przechodzi ani NEF, ani pełny JPEG.
+
+        Tryb pełny pozostawia starszy przepływ RAW+JPEG + opcjonalny NEF
+        na laptopie.
         """
         save_dir = Path(save_dir).expanduser()
-        save_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         self.prepare_capture_setup(fast_jpeg=fast_jpeg)
 
-        stamp = datetime.now().strftime(
-            "%Y-%m-%d_%H-%M-%S_%f"
-        )
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
         basename = f"photo_{stamp}"
-        filename_pattern = save_dir / f"{basename}.%C"
 
+        if not need_raw_path:
+            # ----------------------------------------------------
+            # SZYBKI TRYB: RAW NA SD + MAŁY JPG PROXY NA LAPTOP
+            # ----------------------------------------------------
+            capture_started = time.monotonic()
+            output = self.run(
+                "--capture-image",
+                timeout=15,
+            )
+            capture_only_seconds = time.monotonic() - capture_started
+
+            # Dla RAW-only Nikon powinien zwrócić dokładną ścieżkę NEF-a.
+            raw_matches = re.findall(
+                r"(/[^\r\n]*?\.(?:NEF|RAW))(?=\s|$)",
+                output,
+                flags=re.IGNORECASE,
+            )
+            # Poprawka dla klasycznej ścieżki /store/.../DSC_0001.NEF.
+            if not raw_matches:
+                raw_matches = re.findall(
+                    r"(/[^\r\n]*?\.(?:NEF|RAW))(?=\s|$)",
+                    output,
+                    flags=re.IGNORECASE,
+                )
+
+            if not raw_matches:
+                raise GPhotoError(
+                    "Zdjęcie zostało wykonane, ale gphoto2 nie zwrócił "
+                    "ścieżki pliku RAW na karcie.\n\n"
+                    f"Odpowiedź gphoto2:\n{output.strip()}"
+                )
+
+            raw_camera_path = raw_matches[-1]
+            raw_camera_folder, raw_camera_name = raw_camera_path.rsplit("/", 1)
+            if not raw_camera_folder:
+                raw_camera_folder = "/"
+
+            proxy_path = save_dir / f"{basename}.jpg"
+
+            thumb_started = time.monotonic()
+            try:
+                self.run(
+                    "--folder",
+                    raw_camera_folder,
+                    "--get-thumbnail",
+                    raw_camera_name,
+                    "--filename",
+                    str(proxy_path),
+                    "--force-overwrite",
+                    timeout=12,
+                )
+                proxy_source = "thumbnail"
+            except Exception:
+                # Niektóre kombinacje aparatu/libgphoto2 nie udostępniają
+                # thumbnail dla NEF. Awaryjnie pobieramy tylko klatkę preview
+                # i zapisujemy ją jako mały JPEG; RAW nadal nie jest pobierany.
+                image = self.capture_preview()
+                image.save(proxy_path, format="JPEG", quality=80, optimize=True)
+                proxy_source = "preview"
+
+            thumb_seconds = time.monotonic() - thumb_started
+            total_seconds = time.monotonic() - capture_started
+
+            if not proxy_path.exists() or proxy_path.stat().st_size <= 0:
+                raise GPhotoError(
+                    "RAW został zapisany na karcie, ale nie udało się utworzyć "
+                    "małego JPG proxy na laptopie."
+                )
+
+            return {
+                "jpeg": proxy_path,
+                "raw": None,
+                "raw_camera_folder": raw_camera_folder,
+                "raw_camera_name": raw_camera_name,
+                "capture_seconds": total_seconds,
+                "capture_only_seconds": capture_only_seconds,
+                "proxy_seconds": thumb_seconds,
+                "proxy_source": proxy_source,
+            }
+
+        # --------------------------------------------------------
+        # TRYB PEŁNY: dotychczasowy RAW + JPEG na laptop
+        # --------------------------------------------------------
+        filename_pattern = save_dir / f"{basename}.%C"
         capture_args = [
             "--force-overwrite",
             "--filename",
             str(filename_pattern),
             "--capture-image-and-download",
+            "--keep",
+            "--keep-raw",
         ]
 
-        # Kluczowe: w trybie JPEG-only NIE łączymy --keep z --keep-raw.
-        # --keep-raw oznacza: RAW zostaje na aparacie, pobierany jest JPEG.
-        # Dzięki temu NEF nie powinien przechodzić przez USB w tym etapie.
-        if not need_raw_path:
-            capture_args.append("--keep-raw")
-        else:
-            # W trybie pełnym nadal zachowujemy pliki na karcie.
-            capture_args.extend(["--keep", "--keep-raw"])
-
         capture_started = time.monotonic()
-        # W trybie JPEG-only nie akceptujemy minutowego zawieszenia PTP.
-        # Normalny mały JPEG powinien wrócić dużo wcześniej.
-        capture_timeout = 20 if not need_raw_path else 120
-        output = self.run(
-            *capture_args,
-            timeout=capture_timeout,
-        )
+        output = self.run(*capture_args, timeout=120)
         capture_seconds = time.monotonic() - capture_started
 
-        # Lokalnie powinien być już JPEG.
         files = sorted(
             path
             for path in save_dir.glob(f"{basename}.*")
             if path.is_file()
         )
-
         jpeg_files = [
-            path
-            for path in files
+            path for path in files
             if path.suffix.lower() in {".jpg", ".jpeg"}
         ]
 
-        # Bezpiecznik diagnostyczny: w trybie JPEG-only żaden lokalny NEF
-        # nie powinien powstać. Jeśli libgphoto2 mimo wszystko go zapisze,
-        # zgłaszamy to wyraźnie zamiast udawać, że tryb działa poprawnie.
-        if not need_raw_path:
-            unexpected_raw = [
-                path for path in files
-                if path.suffix.lower() in {".nef", ".raw"}
-            ]
-            if unexpected_raw:
-                names = ", ".join(path.name for path in unexpected_raw)
-                raise GPhotoError(
-                    "Tryb JPEG-only nie został wykonany poprawnie: "
-                    f"gphoto2 zapisał lokalnie RAW ({names}). "
-                    "RAW powinien pozostać wyłącznie na karcie SD."
-                )
-
         if not jpeg_files:
-            found = ", ".join(
-                path.name
-                for path in files
-            ) or "brak"
-
+            found = ", ".join(path.name for path in files) or "brak"
             raise GPhotoError(
-                "Zdjęcie zostało wykonane, ale JPEG nie pojawił się "
-                "na dysku.\n"
+                "Zdjęcie zostało wykonane, ale JPEG nie pojawił się na dysku.\n"
                 f"Znalezione pliki: {found}"
             )
 
-        # Jeśli na laptop ma trafić tylko JPEG, kończymy tutaj.
-        # RAW/NEF pozostaje na karcie SD i w ogóle nie jest transmitowany USB.
-        if not need_raw_path:
-            return {
-                "jpeg": jpeg_files[0],
-                "raw": None,
-                "raw_camera_folder": None,
-                "raw_camera_name": None,
-                "capture_seconds": capture_seconds,
-            }
-
-        # gphoto2 z --keep-raw wypisuje lokalizację NEF na aparacie,
-        # ale go jeszcze nie pobiera. Przy wymuszonym LC_ALL=C format
-        # komunikatu jest przewidywalny.
         raw_matches = re.findall(
             r"(/[^\r\n]*?\.NEF)(?=\s|$)",
             output,
             flags=re.IGNORECASE,
         )
-
         if not raw_matches:
             raise GPhotoError(
                 "JPEG został pobrany, ale program nie potrafił ustalić "
-                "lokalizacji pliku NEF na karcie.\n\n"
-                "RAW powinien nadal znajdować się na karcie SD."
+                "lokalizacji pliku NEF na karcie."
             )
 
         raw_camera_path = raw_matches[-1]
-        raw_camera_folder, raw_camera_name = raw_camera_path.rsplit(
-            "/",
-            1,
-        )
-
+        raw_camera_folder, raw_camera_name = raw_camera_path.rsplit("/", 1)
         if not raw_camera_folder:
             raw_camera_folder = "/"
 
         raw_local_path = save_dir / f"{basename}.NEF"
-
         return {
             "jpeg": jpeg_files[0],
             "raw": raw_local_path,
@@ -1017,6 +1063,7 @@ class GPhotoGUI:
         # RAW/NEF nadal zostaje na karcie SD aparatu.
         self.laptop_jpeg_only_var = tk.BooleanVar(value=True)
         self.current_capture_jpeg_only = False
+        self.deferred_scan_after_id = None
 
         # Folder i tryb używane przez aktualnie trwającą serię.
         self.series_save_dir = SAVE_DIR
@@ -1393,7 +1440,7 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="✓ Na laptop TYLKO szybki JPEG; RAW TYLKO na SD",
+            text="✓ Na laptop mały JPG proxy; pełny RAW tylko na SD",
             variable=self.laptop_jpeg_only_var,
             command=self.on_laptop_jpeg_only_changed,
         )
@@ -1674,11 +1721,11 @@ class GPhotoGUI:
         jpeg_size = self.controller._capture_setup_jpeg_size
         if jpeg_size:
             self.status_var.set(
-                f"Aparat podłączony • JPEG-only AKTYWNY • {quality} • rozmiar {jpeg_size} • RAW tylko SD"
+                f"Aparat podłączony • JPG PROXY AKTYWNY • {quality} • rozmiar {jpeg_size} • RAW tylko SD"
             )
         else:
             self.status_var.set(
-                f"Aparat podłączony • JPEG-only AKTYWNY • {quality} • RAW tylko SD"
+                f"Aparat podłączony • JPG PROXY AKTYWNY • {quality} • RAW tylko SD"
             )
 
         self.live_button.config(
@@ -1906,6 +1953,7 @@ class GPhotoGUI:
     # --------------------------------------------------------
 
     def toggle_live(self):
+        self._cancel_deferred_settings_scan()
         self.live_enabled = not self.live_enabled
 
         if self.live_enabled:
@@ -1992,9 +2040,9 @@ class GPhotoGUI:
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
-            "Ustawiam szybki JPEG (Basic + najmniejszy dostępny rozmiar)..."
+            "Ustawiam szybki tryb: RAW na SD + mały JPG proxy na laptop..."
             if fast_jpeg
-            else "Przywracam JPEG Fine i poprzedni rozmiar..."
+            else "Przywracam JPEG Fine + RAW..."
         )
 
         future = self.executor.submit(
@@ -2018,15 +2066,15 @@ class GPhotoGUI:
             messagebox.showerror("Ustawienia JPEG", str(exc))
         else:
             if fast_jpeg:
-                quality = self.controller._capture_setup_quality or "JPEG Basic"
+                quality = self.controller._capture_setup_quality or "NEF (RAW)"
                 jpeg_size = self.controller._capture_setup_jpeg_size
                 if jpeg_size:
                     self.status_var.set(
-                        f"Tryb gotowy: {quality}; JPEG {jpeg_size} na laptop, RAW na SD"
+                        f"Tryb gotowy: {quality} na SD; {jpeg_size} na laptop"
                     )
                 else:
                     self.status_var.set(
-                        f"Tryb gotowy: {quality}; rozmiaru JPEG aparat nie udostępnił, RAW na SD"
+                        f"Tryb gotowy: {quality} na SD; mały JPG proxy na laptop"
                     )
             else:
                 self.status_var.set(
@@ -2045,27 +2093,60 @@ class GPhotoGUI:
                 )
                 self.laptop_jpeg_only_check.config(state="normal")
 
-    def _scan_after_single_capture(self, final_status):
-        """Skanuje i przygotowuje aparat dopiero PO pojedynczym zdjęciu."""
+    def _cancel_deferred_settings_scan(self):
+        if self.deferred_scan_after_id is not None:
+            try:
+                self.root.after_cancel(self.deferred_scan_after_id)
+            except tk.TclError:
+                pass
+            self.deferred_scan_after_id = None
+
+    def _schedule_deferred_settings_scan(self, fast_jpeg):
+        """Skan dopiero po 5 s bezczynności; nie blokuje gotowego zdjęcia."""
+        self._cancel_deferred_settings_scan()
         if self.closing or not self.controller:
             return
+        self.deferred_scan_after_id = self.root.after(
+            5000,
+            lambda: self._start_deferred_settings_scan(bool(fast_jpeg)),
+        )
 
-
-        fast_jpeg = self.current_capture_jpeg_only
-        self.status_var.set(final_status + " • sprawdzam ustawienia na następne zdjęcie...")
-
+    def _start_deferred_settings_scan(self, fast_jpeg):
+        self.deferred_scan_after_id = None
+        if self.closing or not self.controller or self.series_running or self.live_enabled:
+            self._schedule_deferred_settings_scan(fast_jpeg)
+            return
         future = self.executor.submit(
             self.controller.scan_and_prepare_capture_setup,
             fast_jpeg,
         )
         future.add_done_callback(
-            lambda f: self.root.after(
-                0,
-                self._scan_after_single_done,
-                f,
-                final_status,
-            )
+            lambda f: self.root.after(0, self._deferred_settings_scan_done, f)
         )
+
+    def _deferred_settings_scan_done(self, future):
+        try:
+            self.config_paths = future.result()
+        except Exception:
+            # To jest odświeżenie pomocnicze i nie może psuć fotografowania.
+            pass
+
+    def _scan_after_single_capture(self, final_status):
+        """Zdjęcie jest od razu gotowe; skan ustawień dopiero po bezczynności."""
+        self.status_var.set(final_status)
+        if not self.closing:
+            self.capture_button.config(
+                state="normal" if self.controller else "disabled"
+            )
+            self.series_start_button.config(
+                state="normal" if self.controller else "disabled"
+            )
+            self.refresh_button.config(
+                state="normal" if self.controller else "disabled"
+            )
+            self.laptop_jpeg_only_check.config(state="normal")
+        self._resume_live_after_single_capture()
+        self._schedule_deferred_settings_scan(self.current_capture_jpeg_only)
 
     def _scan_after_single_done(self, future, final_status):
         try:
@@ -2091,31 +2172,15 @@ class GPhotoGUI:
             self._resume_live_after_single_capture()
 
     def _scan_after_series(self, final_status, progress_status=None, play_sound=False):
-        """Skanuje aparat raz po zakończeniu/zatrzymaniu całej serii."""
-        if self.closing or not self.controller:
-            self._restore_after_series()
-            return
-
+        """Kończy serię od razu; skan ustawień robi później, gdy aparat jest wolny."""
         self.series_capture_in_progress = False
-        self.status_var.set(final_status + " • sprawdzam ustawienia...")
+        self.status_var.set(final_status)
         if progress_status is not None:
             self.series_progress_var.set(progress_status)
-
-        fast_jpeg = self.series_jpeg_only
-        future = self.executor.submit(
-            self.controller.scan_and_prepare_capture_setup,
-            fast_jpeg,
-        )
-        future.add_done_callback(
-            lambda f: self.root.after(
-                0,
-                self._scan_after_series_done,
-                f,
-                final_status,
-                progress_status,
-                play_sound,
-            )
-        )
+        self._restore_after_series()
+        if play_sound:
+            self.play_completion_sound()
+        self._schedule_deferred_settings_scan(self.series_jpeg_only)
 
     def _scan_after_series_done(
         self,
@@ -2161,6 +2226,7 @@ class GPhotoGUI:
     def capture_photo(self):
         if not self.controller:
             return
+        self._cancel_deferred_settings_scan()
 
         try:
             save_dir = self.get_save_directory()
@@ -2270,15 +2336,21 @@ class GPhotoGUI:
                 jpeg_dims = "?×?"
 
             capture_seconds = result.get("capture_seconds")
-            time_info = (
-                f" • capture+USB {capture_seconds:.1f} s"
-                if isinstance(capture_seconds, (int, float))
-                else ""
-            )
+            capture_only = result.get("capture_only_seconds")
+            proxy_seconds = result.get("proxy_seconds")
+            source = result.get("proxy_source", "thumbnail")
+            parts = []
+            if isinstance(capture_only, (int, float)):
+                parts.append(f"RAW→SD {capture_only:.1f} s")
+            if isinstance(proxy_seconds, (int, float)):
+                parts.append(f"proxy→USB {proxy_seconds:.1f} s")
+            if not parts and isinstance(capture_seconds, (int, float)):
+                parts.append(f"razem {capture_seconds:.1f} s")
+            time_info = (" • " + " • ".join(parts)) if parts else ""
 
             final_status = (
-                f"JPEG: {result['jpeg'].name} • {jpeg_dims} • {jpeg_info}"
-                f"{time_info} • RAW tylko na karcie SD"
+                f"JPG proxy: {result['jpeg'].name} • {jpeg_dims} • {jpeg_info}"
+                f"{time_info} • źródło: {source} • pełny RAW tylko na SD"
             )
             self._scan_after_single_capture(final_status)
             return
@@ -2328,6 +2400,7 @@ class GPhotoGUI:
     def start_series(self):
         if not self.controller or self.series_running:
             return
+        self._cancel_deferred_settings_scan()
 
         try:
             count = int(self.series_count_var.get())
@@ -2410,6 +2483,7 @@ class GPhotoGUI:
             return
 
         self.series_running = False
+        self._cancel_deferred_settings_scan()
 
         if self.series_after_id is not None:
             try:
@@ -2522,7 +2596,7 @@ class GPhotoGUI:
             capture_seconds = result.get("capture_seconds")
             if isinstance(capture_seconds, (int, float)):
                 self.status_var.set(
-                    f"Seria {shot_number}/{self.series_total}: JPEG gotowy w {capture_seconds:.1f} s • RAW tylko SD"
+                    f"Seria {shot_number}/{self.series_total}: JPG proxy gotowy w {capture_seconds:.1f} s • pełny RAW tylko SD"
                 )
             self._series_shot_finished(shot_number, jpeg_only=True)
             return
@@ -2608,7 +2682,7 @@ class GPhotoGUI:
             return
 
         # Interwał liczony jest od rozpoczęcia poprzedniej ekspozycji.
-        # W trybie JPEG-only nie czekamy na żaden transfer RAW, więc kolejna
+        # W trybie JPG proxy nie czekamy na żaden transfer RAW, więc kolejna
         # klatka może ruszyć zgodnie z zadanym interwałem dużo wcześniej.
         elapsed = 0.0
         if self.series_last_start is not None:
@@ -2619,7 +2693,7 @@ class GPhotoGUI:
             self.series_interval - elapsed,
         )
 
-        mode_text = "JPEG na laptopie; RAW na SD" if jpeg_only else "JPEG + RAW na laptopie"
+        mode_text = "JPG proxy na laptopie; RAW na SD" if jpeg_only else "JPEG + RAW na laptopie"
         self.status_var.set(
             f"Seria: {self.series_done}/{self.series_total}; {mode_text}; "
             f"następne za {wait_seconds:.1f} s"
