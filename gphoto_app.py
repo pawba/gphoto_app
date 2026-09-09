@@ -426,19 +426,26 @@ class GPhotoController:
                     return 10
             return 0
 
+        quality_candidates = [
+            "imagequality",
+            "imagequality2",
+            "image-quality",
+            "imageformat",
+            "image-format",
+        ]
         self._capture_setup_quality = self._set_choice_containing(
             config_paths,
-            [
-                "imagequality",
-                "imagequality2",
-                "image-quality",
-                "imageformat",
-                "image-format",
-            ],
+            quality_candidates,
             raw_jpeg_choice,
             "format RAW (NEF) + JPEG",
             prefer=quality_preference,
         )
+
+        if fast_jpeg and "basic" not in self._capture_setup_quality.lower():
+            raise GPhotoError(
+                "Aparat nie przyjął trybu NEF + JPEG Basic. "
+                f"Aktualnie wybrano: {self._capture_setup_quality}"
+            )
 
         # Znajdź ustawienie rozmiaru JPEG. Nie bierzemy ścieżek RAW/NEF.
         size_candidates = [
@@ -466,6 +473,13 @@ class GPhotoController:
                     break
 
         self._capture_setup_jpeg_size = None
+
+        if fast_jpeg and not size_path:
+            raise GPhotoError(
+                "Nie znaleziono ustawienia rozmiaru JPEG w aparacie. "
+                "Nie wykonuję zdjęcia w trybie szybkim, żeby nie przesyłać "
+                "pełnowymiarowego JPEG-a przez USB."
+            )
 
         if size_path:
             try:
@@ -537,10 +551,19 @@ class GPhotoController:
                     selected_size = min(choices, key=size_key)
                     if current_size != selected_size:
                         self.set_config(size_path, selected_size)
-                    self._capture_setup_jpeg_size = selected_size
+
+                    # Odczyt zwrotny: nie ufamy samemu --set-config.
+                    verified_size = self.get_config(size_path).get("current")
+                    if verified_size != selected_size:
+                        raise GPhotoError(
+                            "Aparat nie przyjął najmniejszego rozmiaru JPEG. "
+                            f"Żądano: {selected_size}; aparat zgłasza: {verified_size}."
+                        )
+                    self._capture_setup_jpeg_size = verified_size
 
             except GPhotoError:
-                # Basic nadal działa. Nie twierdzimy jednak w GUI, że mamy S.
+                if fast_jpeg:
+                    raise
                 self._capture_setup_jpeg_size = None
 
         self._capture_setup_ready = True
@@ -564,8 +587,9 @@ class GPhotoController:
         """
         Etap 1:
         - wykonuje zdjęcie w trybie NEF+JPEG,
-        - zostawia OBA pliki na karcie SD,
-        - pobiera na komputer tylko JPEG.
+        - wykonuje RAW+JPEG,
+        - w trybie JPEG-only RAW zostaje na karcie SD,
+        - na komputer pobiera wyłącznie JPEG.
 
         Dzięki --keep-raw JPEG jest dostępny do podglądu znacznie wcześniej.
         NEF jest pobierany osobno przez download_raw(), ale tylko gdy GUI
@@ -585,13 +609,24 @@ class GPhotoController:
         basename = f"photo_{stamp}"
         filename_pattern = save_dir / f"{basename}.%C"
 
-        output = self.run(
+        capture_args = [
             "--force-overwrite",
             "--filename",
             str(filename_pattern),
             "--capture-image-and-download",
-            "--keep",
-            "--keep-raw",
+        ]
+
+        # Kluczowe: w trybie JPEG-only NIE łączymy --keep z --keep-raw.
+        # --keep-raw oznacza: RAW zostaje na aparacie, pobierany jest JPEG.
+        # Dzięki temu NEF nie powinien przechodzić przez USB w tym etapie.
+        if not need_raw_path:
+            capture_args.append("--keep-raw")
+        else:
+            # W trybie pełnym nadal zachowujemy pliki na karcie.
+            capture_args.extend(["--keep", "--keep-raw"])
+
+        output = self.run(
+            *capture_args,
             timeout=120,
         )
 
@@ -607,6 +642,22 @@ class GPhotoController:
             for path in files
             if path.suffix.lower() in {".jpg", ".jpeg"}
         ]
+
+        # Bezpiecznik diagnostyczny: w trybie JPEG-only żaden lokalny NEF
+        # nie powinien powstać. Jeśli libgphoto2 mimo wszystko go zapisze,
+        # zgłaszamy to wyraźnie zamiast udawać, że tryb działa poprawnie.
+        if not need_raw_path:
+            unexpected_raw = [
+                path for path in files
+                if path.suffix.lower() in {".nef", ".raw"}
+            ]
+            if unexpected_raw:
+                names = ", ".join(path.name for path in unexpected_raw)
+                raise GPhotoError(
+                    "Tryb JPEG-only nie został wykonany poprawnie: "
+                    f"gphoto2 zapisał lokalnie RAW ({names}). "
+                    "RAW powinien pozostać wyłącznie na karcie SD."
+                )
 
         if not jpeg_files:
             found = ", ".join(
@@ -937,7 +988,7 @@ class GPhotoGUI:
 
         # Gdy włączone, na laptop trafia tylko JPEG.
         # RAW/NEF nadal zostaje na karcie SD aparatu.
-        self.laptop_jpeg_only_var = tk.BooleanVar(value=False)
+        self.laptop_jpeg_only_var = tk.BooleanVar(value=True)
         self.current_capture_jpeg_only = False
 
         # Folder i tryb używane przez aktualnie trwającą serię.
@@ -1315,7 +1366,7 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="Na laptop szybki JPEG; RAW zostaje na SD",
+            text="✓ Na laptop TYLKO szybki JPEG; RAW TYLKO na SD",
             variable=self.laptop_jpeg_only_var,
             command=self.on_laptop_jpeg_only_changed,
         )
@@ -1543,7 +1594,7 @@ class GPhotoGUI:
         # Jednorazowo przygotowujemy aparat przy starcie. Dzięki temu pierwsze
         # zdjęcie nie zaczyna się od skanowania konfiguracji.
         controller.prepare_capture_setup(
-            fast_jpeg=False,
+            fast_jpeg=True,
             config_paths=config_paths,
         )
 
@@ -1592,9 +1643,16 @@ class GPhotoGUI:
             text=camera_name
         )
 
-        self.status_var.set(
-            "Aparat podłączony"
-        )
+        quality = self.controller._capture_setup_quality or "NEF + JPEG Basic"
+        jpeg_size = self.controller._capture_setup_jpeg_size
+        if jpeg_size:
+            self.status_var.set(
+                f"Aparat podłączony • JPEG-only AKTYWNY • {quality} • rozmiar {jpeg_size} • RAW tylko SD"
+            )
+        else:
+            self.status_var.set(
+                f"Aparat podłączony • JPEG-only AKTYWNY • {quality} • RAW tylko SD"
+            )
 
         self.live_button.config(
             state="normal"
@@ -2150,9 +2208,14 @@ class GPhotoGUI:
             )
 
         if self.current_capture_jpeg_only:
+            try:
+                jpeg_mb = result["jpeg"].stat().st_size / (1024 * 1024)
+                jpeg_info = f"{jpeg_mb:.1f} MB"
+            except OSError:
+                jpeg_info = "rozmiar nieznany"
             final_status = (
-                f"JPEG zapisany na laptopie: {result['jpeg'].name} • "
-                "RAW został na karcie SD"
+                f"JPEG zapisany na laptopie: {result['jpeg'].name} ({jpeg_info}) • "
+                "RAW został wyłącznie na karcie SD"
             )
             self._scan_after_single_capture(final_status)
             return
