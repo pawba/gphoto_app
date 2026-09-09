@@ -99,6 +99,11 @@ class GPhotoController:
         self._capture_setup_quality = None
         self._capture_setup_jpeg_size = None
 
+        # Ostatni znany czas migawki z GUI/gphoto2. Używany tylko do
+        # dobrania timeoutu dla --trigger-capture przy długich ekspozycjach.
+        self._last_shutter_seconds = None
+        self._last_shutter_label = None
+
     def run(self, *args, binary=False, timeout=30):
         cmd = [GPHOTO2, *args]
 
@@ -136,6 +141,73 @@ class GPhotoController:
             "utf-8",
             errors="replace"
         )
+
+    @staticmethod
+    def parse_shutter_seconds(value):
+        """
+        Zamienia typowe wartości czasu migawki z gphoto2 na sekundy.
+
+        Obsługiwane przykłady:
+            1/125, 0.5, 0,5, 2, 2s, 15 sec, 30"
+        Dla Bulb/Time lub nieznanego formatu zwraca None.
+        """
+        if value is None:
+            return None
+
+        raw_text = str(value).strip().lower()
+        if not raw_text:
+            return None
+
+        if "bulb" in raw_text or raw_text in {"b", "time", "--"}:
+            return None
+
+        # 1/125 albo 10/13
+        frac = re.search(r"(-?\d+(?:[\.,]\d+)?)\s*/\s*(-?\d+(?:[\.,]\d+)?)", raw_text)
+        if frac:
+            try:
+                num = float(frac.group(1).replace(",", "."))
+                den = float(frac.group(2).replace(",", "."))
+                if den != 0:
+                    seconds = num / den
+                    if seconds > 0:
+                        return seconds
+            except ValueError:
+                return None
+
+        # 15, 15s, 15 sec, 0.5", 0,5 s
+        number = re.search(r"(-?\d+(?:[\.,]\d+)?)", raw_text)
+        if number:
+            try:
+                seconds = float(number.group(1).replace(",", "."))
+                if seconds > 0:
+                    return seconds
+            except ValueError:
+                return None
+
+        return None
+
+    def remember_shutter_value(self, value):
+        """Zapamiętuje ostatni znany czas migawki bez odpytywania aparatu."""
+        seconds = self.parse_shutter_seconds(value)
+        self._last_shutter_seconds = seconds
+        self._last_shutter_label = str(value) if value is not None else None
+        return seconds
+
+    def trigger_capture_timeout(self):
+        """
+        Timeout dla --trigger-capture.
+
+        Krótkie czasy nadal mają krótki limit. Przy długich ekspozycjach
+        zostawiamy zapas na samą ekspozycję i ewentualny Long Exposure NR,
+        który w Nikonie potrafi zająć dodatkowy czas podobny do ekspozycji.
+        """
+        seconds = self._last_shutter_seconds
+        if seconds is None:
+            # Gdy nie znamy czasu migawki, lepiej nie zabijać długiej ekspozycji
+            # po kilku sekundach. Nadal istnieje limit, żeby proces nie wisiał wiecznie.
+            return 120
+
+        return int(max(12, min(900, seconds * 2.5 + 15)))
 
     def autodetect(self):
         return self.run("--auto-detect")
@@ -340,9 +412,10 @@ class GPhotoController:
               w aparacie przez użytkownika.
 
         fast_jpeg=True:
-            - aparat zapisuje tylko pełny RAW/NEF na kartę SD,
-            - na laptop pobierana jest tylko mała miniatura RAW jako JPG proxy,
-            - pełny RAW nie przechodzi przez USB.
+            - aparat zapisuje RAW/NEF + JPEG na kartę SD,
+            - podczas serii nic nie jest pobierane przez USB,
+            - po serii na laptop pobierane są wyłącznie pełne pliki JPEG,
+            - pełny RAW nigdy nie przechodzi przez USB.
         """
         fast_jpeg = bool(fast_jpeg)
 
@@ -433,36 +506,9 @@ class GPhotoController:
             "image-format",
         ]
 
-        if fast_jpeg:
-            # Najszybszy tryb: aparat zapisuje TYLKO pełny RAW na karcie.
-            # Na laptop pobierzemy potem małą miniaturę tego RAW-a jako JPG.
-            # Nie tworzymy pełnego JPEG-a w aparacie, więc nie ma 9 MB do USB.
-            def raw_only_choice(value):
-                normalized = (
-                    value.lower()
-                    .replace(" ", "")
-                    .replace("_", "")
-                    .replace("-", "")
-                )
-                has_raw = "raw" in normalized or "nef" in normalized
-                has_jpeg = "jpeg" in normalized or "jpg" in normalized
-                has_combo_quality = any(
-                    q in normalized for q in ("fine", "normal", "basic")
-                )
-                return has_raw and not has_jpeg and not has_combo_quality
-
-            self._capture_setup_quality = self._set_choice_containing(
-                config_paths,
-                quality_candidates,
-                raw_only_choice,
-                "format RAW (NEF) bez JPEG",
-            )
-
-            self._capture_setup_jpeg_size = "proxy z miniatury RAW"
-            self._capture_setup_ready = True
-            self._capture_setup_fast_jpeg = fast_jpeg
-            return
-
+        # W obu trybach aparat zapisuje RAW + JPEG na karcie. W trybie
+        # szybkim preferujemy JPEG Basic, ponieważ po zakończeniu serii
+        # pobieramy tylko JPEG-y. Sam RAW nigdy nie jest transferowany.
         self._capture_setup_quality = self._set_choice_containing(
             config_paths,
             quality_candidates,
@@ -499,11 +545,10 @@ class GPhotoController:
         self._capture_setup_jpeg_size = None
 
         if fast_jpeg and not size_path:
-            raise GPhotoError(
-                "Nie znaleziono ustawienia rozmiaru JPEG w aparacie. "
-                "Nie wykonuję zdjęcia w trybie szybkim, żeby nie przesyłać "
-                "pełnowymiarowego JPEG-a przez USB."
-            )
+            # Nie każdy backend Nikona wystawia osobne imagesize.
+            # To nie może blokować zdjęcia: jakość Basic nadal zmniejsza JPEG,
+            # a po serii pobieramy wyłącznie JPEG, nigdy RAW.
+            self._capture_setup_jpeg_size = "rozmiar z aparatu"
 
         if size_path:
             try:
@@ -630,12 +675,11 @@ class GPhotoController:
         """
         Fotografowanie.
 
-        fast_jpeg / JPG proxy:
-            1. aparat zapisuje TYLKO pełny NEF na karcie SD,
-            2. pobieramy z aparatu wyłącznie miniaturę tego NEF-a,
-            3. miniaturę zapisujemy na laptopie jako JPG proxy.
-
-        Dzięki temu przez USB nie przechodzi ani NEF, ani pełny JPEG.
+        fast_jpeg / JPEG-only na laptop:
+            1. aparat zapisuje RAW + JPEG na karcie SD,
+            2. podczas fotografowania wykonujemy tylko szybki trigger,
+            3. pełne JPEG-i pobieramy dopiero po serii / w bezczynności,
+            4. RAW nigdy nie jest pobierany na laptop.
 
         Tryb pełny pozostawia starszy przepływ RAW+JPEG + opcjonalny NEF
         na laptopie.
@@ -650,24 +694,29 @@ class GPhotoController:
 
         if not need_raw_path:
             # ----------------------------------------------------
-            # ULTRASZYBKI TRYB: RAW NA SD, ZERO CZEKANIA NA FILEADDED
+            # ULTRASZYBKI TRYB: RAW+JPEG NA SD, ZERO CZEKANIA NA FILEADDED
             # ----------------------------------------------------
             # Użytkownik potwierdził na D5300, że samo --trigger-capture
             # wraca po ok. 2 s, natomiast oczekiwanie na FILEADDED trwa
             # ok. 39 s. Dlatego w krytycznej ścieżce fotografowania
             # NIE czekamy na żadne zdarzenie plikowe i niczego nie
-            # pobieramy z aparatu. JPG proxy synchronizujemy dopiero
+            # pobieramy z aparatu. Pełne JPEG-i synchronizujemy dopiero
             # po zakończeniu serii / podczas bezczynności.
             capture_started = time.monotonic()
+            trigger_timeout = self.trigger_capture_timeout()
+            shutter_label = self._last_shutter_label or "nieznany"
             try:
                 output = self.run(
                     "--trigger-capture",
-                    timeout=8,
+                    timeout=trigger_timeout,
                 )
             except GPhotoError as exc:
                 raise GPhotoError(
-                    "D5300 nie zakończył --trigger-capture w 8 s.\n\n"
-                    "W ultraszybkim trybie nie czekamy na FILEADDED i nie "
+                    f"D5300 nie zakończył --trigger-capture w {trigger_timeout} s.\n\n"
+                    f"Ostatni znany czas migawki: {shutter_label}. "
+                    "Przy długich ekspozycjach trigger może wrócić dopiero "
+                    "po zakończeniu ekspozycji i ewentualnego Long Exposure NR.\n\n"
+                    "W szybkim trybie nadal nie czekamy na FILEADDED i nie "
                     "pobieramy żadnego pliku podczas wykonywania klatki.\n\n"
                     f"Szczegóły: {exc}"
                 ) from exc
@@ -680,10 +729,12 @@ class GPhotoController:
                 "raw_camera_name": None,
                 "capture_seconds": capture_seconds,
                 "capture_only_seconds": capture_seconds,
-                "proxy_seconds": None,
-                "proxy_source": "odroczony",
-                "proxy_pending": True,
+                "JPEG_seconds": None,
+                "JPEG_source": "pełny JPEG odroczony",
+                "JPEG_pending": True,
                 "trigger_output": output,
+                "trigger_timeout": trigger_timeout,
+                "shutter_label": shutter_label,
             }
 
         # --------------------------------------------------------
@@ -745,68 +796,244 @@ class GPhotoController:
             "capture_seconds": capture_seconds,
         }
 
-    def list_camera_raw_files(self, timeout=12):
-        """Zwraca listę (folder, nazwa) plików NEF/RAW widocznych na karcie."""
-        output = self.run("--list-files", timeout=timeout)
-        current_folder = None
-        files = []
+    def _discover_active_dcim_folder(self, timeout=8):
+        """
+        Znajduje właściwy katalog zdjęć na karcie bez kosztownego --list-files
+        od katalogu głównego. --list-folders zwraca tylko strukturę katalogów,
+        więc na kartach z dużą liczbą zdjęć jest znacznie lżejszy.
+        """
+        cached = getattr(self, "_active_dcim_folder", None)
+        if cached:
+            return cached
+
+        output = self.run("--list-folders", timeout=timeout)
+        current_parent = None
+        folders = []
 
         for raw_line in output.splitlines():
             line = raw_line.strip()
-            folder_match = re.search(
-                r"folder\s+[\"']([^\"']+)[\"']",
+            parent_match = re.search(
+                r"folders?\s+in\s+folder\s+[\"']([^\"']+)[\"']",
                 line,
                 flags=re.IGNORECASE,
             )
-            if folder_match:
-                current_folder = folder_match.group(1)
+            if parent_match:
+                current_parent = parent_match.group(1)
                 continue
 
-            file_match = re.match(
-                r"#\d+\s+([^\s]+\.(?:NEF|RAW))(?:\s|$)",
-                line,
-                flags=re.IGNORECASE,
-            )
-            if file_match and current_folder:
-                files.append((current_folder, file_match.group(1)))
+            child_match = re.match(r"-\s+(.+)$", line)
+            if child_match and current_parent:
+                child = child_match.group(1).strip()
+                if current_parent == "/":
+                    full = "/" + child
+                else:
+                    full = current_parent.rstrip("/") + "/" + child
+                folders.append(full)
 
+        # Nikon D5300 typowo używa np. /store_00010001/DCIM/100D5300.
+        dcim_leafs = [
+            f for f in folders
+            if "/DCIM/" in f.upper() and f.rstrip("/").count("/") >= 3
+        ]
+        if not dcim_leafs:
+            raise GPhotoError(
+                "Nie udało się znaleźć katalogu zdjęć DCIM na karcie."
+            )
+
+        # Foldery DCF rosną zwykle 100..., 101..., 102...; wybieramy ostatni.
+        dcim_leafs.sort()
+        selected = dcim_leafs[-1]
+        self._active_dcim_folder = selected
+        return selected
+
+    def list_camera_files(self, timeout=8):
+        """Zwraca (numer, folder, nazwa) plików z aktywnego katalogu DCIM."""
+        folder = self._discover_active_dcim_folder(timeout=min(timeout, 8))
+        output = self.run(
+            "--folder",
+            folder,
+            "--no-recurse",
+            "--list-files",
+            timeout=timeout,
+        )
+        files = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            file_match = re.match(r"#(\d+)\s+([^\s]+)(?:\s|$)", line)
+            if file_match:
+                files.append((int(file_match.group(1)), folder, file_match.group(2)))
         return files
 
-    def download_recent_raw_thumbnails(self, save_dir, count=1):
+    def download_recent_camera_jpegs(self, save_dir, count=1, exclude_names=None):
         """
-        Po fotografowaniu pobiera wyłącznie miniatury ostatnich RAW-ów.
-        Ta funkcja nigdy nie jest wywoływana w krytycznej pętli serii.
+        Pobiera najnowsze pełne JPEG-i z aktywnego katalogu aparatu.
+
+        Nie używamy --get-thumbnail. Po szybkiej serii bierzemy pełne pliki
+        .JPG zapisane na karcie SD. Lista exclude_names pozwala odróżnić nowe
+        klatki serii od JPEG-ów, które były już na karcie przed startem.
         """
         save_dir = Path(save_dir).expanduser()
         save_dir.mkdir(parents=True, exist_ok=True)
         count = max(1, int(count))
 
-        files = self.list_camera_raw_files(timeout=12)
-        if not files:
+        exclude_names = exclude_names or set()
+        excluded_names = {str(name).lower() for name in exclude_names}
+        excluded_stems = {Path(str(name)).stem.lower() for name in exclude_names}
+
+        deadline = time.monotonic() + 75.0
+        selected_jpegs = []
+        folder = None
+        last_state = ""
+        attempts = 0
+
+        while time.monotonic() < deadline:
+            attempts += 1
+
+            # Co kilka prób odświeżamy katalog DCIM. Aparat może założyć nowy
+            # folder, np. po przekroczeniu numeracji, a cache nie może wtedy
+            # trzymać starej ścieżki.
+            if attempts in {1, 5, 10}:
+                self._active_dcim_folder = None
+
+            files = self.list_camera_files(timeout=10)
+            if files:
+                folder = files[-1][1]
+
+            all_jpegs = [
+                item for item in files
+                if Path(item[2]).suffix.lower() in {".jpg", ".jpeg"}
+            ]
+
+            candidates = []
+            for item in all_jpegs:
+                name = item[2]
+                name_lower = name.lower()
+                stem_lower = Path(name).stem.lower()
+                if name_lower in excluded_names or stem_lower in excluded_stems:
+                    continue
+                candidates.append(item)
+
+            selected_jpegs = candidates[-count:]
+            if len(selected_jpegs) >= count:
+                break
+
+            last_state = (
+                f"JPEG nowe/widoczne: {len(candidates)}/{count}; "
+                f"JPEG razem w folderze: {len(all_jpegs)}"
+            )
+            time.sleep(1.5)
+        else:
             raise GPhotoError(
-                "Na karcie nie znaleziono plików RAW do pobrania miniatury."
+                "Aparat nie udostępnił pełnych JPEG w ciągu 75 s. "
+                + (last_state or "Brak plików JPEG w aktywnym folderze DCIM.")
             )
 
-        selected = files[-count:]
+        folder = selected_jpegs[-1][1]
+
+        # Ważne: %f w gphoto2 oznacza nazwę BEZ rozszerzenia. Poprzednia
+        # wersja używała samego %f, więc lokalny plik miał 600 kB, ale nie miał
+        # .JPG i podgląd go ignorował. %C dopisuje oryginalne rozszerzenie.
+        filename_pattern = save_dir / "%f.%C"
+
+        before = {
+            p.name: (p.stat().st_mtime_ns, p.stat().st_size)
+            for p in save_dir.iterdir()
+            if p.is_file()
+        }
+
+        # Nie używamy zakresu typu "1,2,3", bo różne wersje gphoto2 różnie go
+        # interpretują. Powtarzamy --get-file dla każdego numeru JPEG-a, ale w
+        # jednym procesie gphoto2 i z jednym wzorcem nazwy.
+        args = [
+            "--folder",
+            folder,
+            "--no-recurse",
+            "--force-overwrite",
+            "--filename",
+            str(filename_pattern),
+        ]
+        for number, _, _ in selected_jpegs:
+            args.extend(["--get-file", str(number)])
+
+        self.run(
+            *args,
+            timeout=max(25, min(240, count * 15)),
+        )
+
         downloaded = []
-        for folder, name in selected:
-            proxy_path = save_dir / f"{Path(name).stem}.jpg"
-            self.run(
-                "--folder",
-                folder,
-                "--get-thumbnail",
-                name,
-                "--filename",
-                str(proxy_path),
-                "--force-overwrite",
-                timeout=6,
-            )
-            if proxy_path.exists() and proxy_path.stat().st_size > 0:
-                downloaded.append(proxy_path)
+        for _, _, camera_name in selected_jpegs:
+            camera_path = Path(camera_name)
+            expected = save_dir / camera_path.name
+            stem_only = save_dir / camera_path.stem
 
-        if not downloaded:
+            # Normalna ścieżka: plik ma już rozszerzenie, np. DSC_0490.JPG.
+            if expected.exists() and expected.is_file() and expected.stat().st_size > 0:
+                downloaded.append(expected)
+                continue
+
+            # Fallback dla starszego błędu albo backendu, który mimo wzorca
+            # zostawił nazwę bez rozszerzenia. Dopisujemy oryginalne .JPG.
+            if stem_only.exists() and stem_only.is_file() and stem_only.stat().st_size > 0:
+                try:
+                    if expected.exists():
+                        expected.unlink()
+                    stem_only.rename(expected)
+                    downloaded.append(expected)
+                    continue
+                except OSError:
+                    downloaded.append(stem_only)
+                    continue
+
+            # Ostatni fallback: szukamy pliku o tym samym stemie niezależnie od
+            # wielkości liter rozszerzenia.
+            stem_lower = camera_path.stem.lower()
+            for candidate in save_dir.iterdir():
+                if not candidate.is_file():
+                    continue
+                if candidate.stem.lower() != stem_lower:
+                    continue
+                if candidate.stat().st_size <= 0:
+                    continue
+                if candidate.suffix.lower() not in {".jpg", ".jpeg"}:
+                    # Jeżeli to znów plik bez rozszerzenia, naprawiamy nazwę.
+                    if not candidate.suffix:
+                        try:
+                            if expected.exists():
+                                expected.unlink()
+                            candidate.rename(expected)
+                            candidate = expected
+                        except OSError:
+                            pass
+                    else:
+                        continue
+                downloaded.append(candidate)
+                break
+
+        # Usuń duplikaty z zachowaniem kolejności.
+        unique = []
+        seen = set()
+        for path in downloaded:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+
+        downloaded = unique
+        if len(downloaded) < count:
+            expected_names = ", ".join(name for _, _, name in selected_jpegs)
+            changed = []
+            for pth in save_dir.iterdir():
+                if not pth.is_file():
+                    continue
+                stat = pth.stat()
+                old = before.get(pth.name)
+                if old is None or (stat.st_mtime_ns, stat.st_size) != old:
+                    changed.append(pth.name)
             raise GPhotoError(
-                "RAW-y są na karcie, ale nie udało się pobrać żadnej miniatury JPG."
+                f"Żądano {count} pełnych JPEG-ów, pobrano {len(downloaded)}. "
+                f"Folder aparatu: {folder}; oczekiwane: {expected_names}; "
+                f"nowe/zmienione lokalnie: {', '.join(changed) or 'brak'}."
             )
 
         return downloaded
@@ -1052,7 +1279,7 @@ class GPhotoGUI:
     def __init__(self, root):
         self.root = root
 
-        self.root.title("gphoto2 Camera Control — fast JPEG v6")
+        self.root.title("gphoto2 Camera Control — gphoto_app")
         self.root.geometry("1200x760")
         self.root.minsize(850, 600)
 
@@ -1088,13 +1315,16 @@ class GPhotoGUI:
         self.laptop_jpeg_only_var = tk.BooleanVar(value=True)
         self.current_capture_jpeg_only = False
         self.deferred_scan_after_id = None
-        self.deferred_proxy_after_id = None
-        self.deferred_proxy_count = 0
-        self.deferred_proxy_dir = SAVE_DIR
+        self.deferred_JPEG_after_id = None
+        self.deferred_JPEG_count = 0
+        self.deferred_JPEG_dir = SAVE_DIR
+        self.deferred_JPEG_exclude_names = set()
+        self.resume_live_after_jpeg_sync = False
 
         # Folder i tryb używane przez aktualnie trwającą serię.
         self.series_save_dir = SAVE_DIR
         self.series_jpeg_only = False
+        self.series_baseline_jpeg_names = set()
 
         # Seria / timelapse
         self.series_count_var = tk.IntVar(value=50)
@@ -1467,7 +1697,7 @@ class GPhotoGUI:
 
         self.laptop_jpeg_only_check = ttk.Checkbutton(
             sidebar,
-            text="⚡ Szybko: RAW na SD; mały JPG proxy po serii / w bezczynności",
+            text="⚡ Szybko: RAW+JPEG na SD; pełny JPG na laptop po serii",
             variable=self.laptop_jpeg_only_var,
             command=self.on_laptop_jpeg_only_changed,
         )
@@ -1479,7 +1709,7 @@ class GPhotoGUI:
 
         ttk.Label(
             sidebar,
-            text="Aparat: RAW (NEF) + JPEG na karcie SD",
+            text="Aparat: RAW (NEF) + JPEG na SD • laptop: tylko JPEG",
             wraplength=300,
         ).pack(
             anchor="w",
@@ -1748,11 +1978,11 @@ class GPhotoGUI:
         jpeg_size = self.controller._capture_setup_jpeg_size
         if jpeg_size:
             self.status_var.set(
-                f"Aparat podłączony • JPG PROXY AKTYWNY • {quality} • rozmiar {jpeg_size} • RAW tylko SD"
+                f"Aparat podłączony • PEŁNY JPG AKTYWNY • {quality} • rozmiar {jpeg_size} • RAW tylko na SD"
             )
         else:
             self.status_var.set(
-                f"Aparat podłączony • JPG PROXY AKTYWNY • {quality} • RAW tylko SD"
+                f"Aparat podłączony • PEŁNY JPG AKTYWNY • {quality} • RAW tylko na SD"
             )
 
         self.live_button.config(
@@ -1838,6 +2068,11 @@ class GPhotoGUI:
                 config = self.controller.get_config(
                     path
                 )
+
+                if display_name == "Czas":
+                    self.controller.remember_shutter_value(
+                        config.get("current")
+                    )
 
                 settings.append(
                     (
@@ -1971,6 +2206,9 @@ class GPhotoGUI:
             )
             return
 
+        if display_name == "Czas" and self.controller:
+            self.controller.remember_shutter_value(value)
+
         self.status_var.set(
             f"{display_name} = {value}"
         )
@@ -2067,7 +2305,7 @@ class GPhotoGUI:
         self.laptop_jpeg_only_check.config(state="disabled")
 
         self.status_var.set(
-            "Ustawiam szybki tryb: RAW na SD; proxy JPG odroczone..."
+            "Ustawiam szybki tryb: RAW+JPEG na SD; pełny JPEG odroczony..."
             if fast_jpeg
             else "Przywracam JPEG Fine + RAW..."
         )
@@ -2120,71 +2358,106 @@ class GPhotoGUI:
                 )
                 self.laptop_jpeg_only_check.config(state="normal")
 
-    def _cancel_deferred_proxy_sync(self):
-        if self.deferred_proxy_after_id is not None:
+    def _cancel_deferred_JPEG_sync(self):
+        if self.deferred_JPEG_after_id is not None:
             try:
-                self.root.after_cancel(self.deferred_proxy_after_id)
+                self.root.after_cancel(self.deferred_JPEG_after_id)
             except tk.TclError:
                 pass
-            self.deferred_proxy_after_id = None
+            self.deferred_JPEG_after_id = None
 
-    def _schedule_deferred_proxy_sync(self, save_dir, count, delay_ms=4000):
-        """Synchronizuje małe JPG dopiero po bezczynności, nigdy między klatkami."""
-        self._cancel_deferred_proxy_sync()
+    def _schedule_deferred_JPEG_sync(self, save_dir, count, delay_ms=4000, exclude_names=None):
+        """Synchronizuje pełne JPEG dopiero po bezczynności, nigdy między klatkami."""
         if self.closing or not self.controller or count <= 0:
             return
-        self.deferred_proxy_dir = Path(save_dir)
-        self.deferred_proxy_count = int(count)
-        self.deferred_proxy_after_id = self.root.after(
+
+        save_dir = Path(save_dir)
+        pending_count = int(count)
+        pending_exclude = set(exclude_names or set())
+
+        # Gdy użytkownik szybko zrobi kilka pojedynczych zdjęć, nie gubimy
+        # wcześniejszych klatek: sumujemy oczekujące JPEG-i z tego samego folderu.
+        if (
+            self.deferred_JPEG_after_id is not None
+            and Path(self.deferred_JPEG_dir) == save_dir
+        ):
+            pending_count += int(self.deferred_JPEG_count)
+            pending_exclude.update(self.deferred_JPEG_exclude_names)
+
+        self._cancel_deferred_JPEG_sync()
+        self.deferred_JPEG_dir = save_dir
+        self.deferred_JPEG_count = pending_count
+        self.deferred_JPEG_exclude_names = pending_exclude
+        self.deferred_JPEG_after_id = self.root.after(
             int(delay_ms),
-            self._start_deferred_proxy_sync,
+            self._start_deferred_JPEG_sync,
         )
 
-    def _start_deferred_proxy_sync(self):
-        self.deferred_proxy_after_id = None
+    def _start_deferred_JPEG_sync(self):
+        self.deferred_JPEG_after_id = None
         if self.closing or not self.controller:
             return
-        if self.series_running or self.live_enabled:
-            self._schedule_deferred_proxy_sync(
-                self.deferred_proxy_dir,
-                self.deferred_proxy_count,
+        if self.series_running:
+            self._schedule_deferred_JPEG_sync(
+                self.deferred_JPEG_dir,
+                self.deferred_JPEG_count,
                 delay_ms=4000,
+                exclude_names=self.deferred_JPEG_exclude_names,
             )
             return
 
-        count = self.deferred_proxy_count
-        save_dir = self.deferred_proxy_dir
+        # Nie odkładaj pobierania JPEG w nieskończoność, gdy działa Live View.
+        # Na czas transferu zatrzymujemy Live View i przywracamy po zakończeniu.
+        self.resume_live_after_jpeg_sync = bool(self.live_enabled)
+        if self.live_enabled:
+            self.toggle_live()
+
+        count = self.deferred_JPEG_count
+        save_dir = self.deferred_JPEG_dir
+        exclude_names = set(self.deferred_JPEG_exclude_names)
         self.status_var.set(
-            f"Zdjęcia zrobione; pobieram {count} małych JPG proxy bez RAW..."
+            f"Zdjęcia zrobione; pobieram {count} pełnych JPEG z karty SD..."
         )
         future = self.executor.submit(
-            self.controller.download_recent_raw_thumbnails,
+            self.controller.download_recent_camera_jpegs,
             save_dir,
             count,
+            exclude_names,
         )
         future.add_done_callback(
-            lambda f: self.root.after(0, self._deferred_proxy_sync_done, f)
+            lambda f: self.root.after(0, self._deferred_JPEG_sync_done, f)
         )
 
-    def _deferred_proxy_sync_done(self, future):
+    def _deferred_JPEG_sync_done(self, future):
         try:
             paths = future.result()
         except Exception as exc:
             self.status_var.set(
-                f"Zdjęcia są na SD; proxy JPG nie pobrane: {exc}"
+                f"Zdjęcia są na SD; pełne JPEG nie pobrane: {exc}"
             )
-            return
-
-        if paths:
-            try:
-                image = Image.open(paths[-1])
-                image.load()
-                self.display_last_image(image.copy())
-            except Exception:
-                pass
-            self.status_var.set(
-                f"Pobrano {len(paths)} małych JPG proxy • pełne RAW-y zostały na SD"
-            )
+            paths = []
+        else:
+            if paths:
+                try:
+                    image = Image.open(paths[-1])
+                    image.load()
+                    self.display_last_image(image.copy())
+                except Exception:
+                    pass
+                self.status_var.set(
+                    f"Pobrano {len(paths)} pełnych JPEG • RAW-y zostały wyłącznie na SD"
+                )
+        finally:
+            self.deferred_JPEG_exclude_names = set()
+            if (
+                self.resume_live_after_jpeg_sync
+                and not self.closing
+                and not self.live_enabled
+            ):
+                self.resume_live_after_jpeg_sync = False
+                self.toggle_live()
+            else:
+                self.resume_live_after_jpeg_sync = False
 
     def _cancel_deferred_settings_scan(self):
         if self.deferred_scan_after_id is not None:
@@ -2224,7 +2497,7 @@ class GPhotoGUI:
             # To jest odświeżenie pomocnicze i nie może psuć fotografowania.
             pass
 
-    def _scan_after_single_capture(self, final_status):
+    def _scan_after_single_capture(self, final_status, schedule_settings=True):
         """Zdjęcie jest od razu gotowe; skan ustawień dopiero po bezczynności."""
         self.status_var.set(final_status)
         if not self.closing:
@@ -2239,7 +2512,8 @@ class GPhotoGUI:
             )
             self.laptop_jpeg_only_check.config(state="normal")
         self._resume_live_after_single_capture()
-        self._schedule_deferred_settings_scan(self.current_capture_jpeg_only)
+        if schedule_settings:
+            self._schedule_deferred_settings_scan(self.current_capture_jpeg_only)
 
     def _scan_after_single_done(self, future, final_status):
         try:
@@ -2274,10 +2548,11 @@ class GPhotoGUI:
         if play_sound:
             self.play_completion_sound()
         if self.series_jpeg_only and self.series_done > 0:
-            self._schedule_deferred_proxy_sync(
+            self._schedule_deferred_JPEG_sync(
                 self.series_save_dir,
                 self.series_done,
                 delay_ms=3000,
+                exclude_names=self.series_baseline_jpeg_names,
             )
         self._schedule_deferred_settings_scan(self.series_jpeg_only)
 
@@ -2326,7 +2601,7 @@ class GPhotoGUI:
         if not self.controller:
             return
         self._cancel_deferred_settings_scan()
-        self._cancel_deferred_proxy_sync()
+        self._cancel_deferred_JPEG_sync()
 
         try:
             save_dir = self.get_save_directory()
@@ -2425,11 +2700,15 @@ class GPhotoGUI:
                 else "gotowe"
             )
             final_status = (
-                f"Migawka zakończona w {time_text} • RAW tylko na SD • "
-                "nie czekam na FILEADDED; JPG proxy pobiorę po 10 s bezczynności"
+                f"Migawka zakończona w {time_text} • RAW+JPEG na SD • "
+                "nie czekam na FILEADDED; pełny JPEG pobiorę po chwili bezczynności"
             )
-            self._scan_after_single_capture(final_status)
-            self._schedule_deferred_proxy_sync(save_dir=Path(self.save_dir_var.get()), count=1, delay_ms=10000)
+            self._scan_after_single_capture(final_status, schedule_settings=False)
+            self._schedule_deferred_JPEG_sync(save_dir=Path(self.save_dir_var.get()), count=1, delay_ms=3000)
+            self.deferred_scan_after_id = self.root.after(
+                15000,
+                lambda: self._start_deferred_settings_scan(self.current_capture_jpeg_only),
+            )
             return
 
         self.status_var.set(
@@ -2478,7 +2757,7 @@ class GPhotoGUI:
         if not self.controller or self.series_running:
             return
         self._cancel_deferred_settings_scan()
-        self._cancel_deferred_proxy_sync()
+        self._cancel_deferred_JPEG_sync()
 
         try:
             count = int(self.series_count_var.get())
@@ -2551,8 +2830,56 @@ class GPhotoGUI:
             )
 
         delay_ms = max(0, int(delay * 1000))
+
+        if self.series_jpeg_only:
+            # Zapamiętujemy JPEG-i obecne na karcie przed startem serii.
+            # Dzięki temu po serii pobieramy nowe zdjęcia, a nie stare końcówki
+            # folderu, jeśli Nikon pokazuje FILEADDED z opóźnieniem.
+            self.status_var.set(
+                "Start serii: sprawdzam obecne JPEG-i na karcie..."
+            )
+            self.series_baseline_jpeg_names = set()
+            future = self.executor.submit(
+                self.controller.list_camera_files,
+                10,
+            )
+            future.add_done_callback(
+                lambda f, ms=delay_ms: self.root.after(
+                    0,
+                    self._series_baseline_done,
+                    f,
+                    ms,
+                )
+            )
+        else:
+            self.series_after_id = self.root.after(
+                delay_ms,
+                self._series_capture_next,
+            )
+
+    def _series_baseline_done(self, future, delay_ms):
+        if not self.series_running or self.closing:
+            return
+
+        try:
+            files = future.result()
+            self.series_baseline_jpeg_names = {
+                name
+                for _, _, name in files
+                if Path(name).suffix.lower() in {".jpg", ".jpeg"}
+            }
+        except Exception as exc:
+            # Nie zatrzymujemy serii tylko dlatego, że nie udało się zrobić
+            # baseline'u. Po serii pobierzemy ostatnie N JPEG-ów.
+            self.series_baseline_jpeg_names = set()
+            self.status_var.set(
+                f"Baseline JPEG nieudany ({exc}); start serii..."
+            )
+        else:
+            self.status_var.set("Start serii...")
+
         self.series_after_id = self.root.after(
-            delay_ms,
+            int(delay_ms),
             self._series_capture_next,
         )
 
@@ -2672,7 +2999,7 @@ class GPhotoGUI:
             if isinstance(capture_seconds, (int, float)):
                 self.status_var.set(
                     f"Seria {shot_number}/{self.series_total}: trigger {capture_seconds:.1f} s • "
-                    "RAW na SD • bez czekania na FILEADDED"
+                    "RAW+JPEG na SD • bez czekania na FILEADDED"
                 )
             self._series_shot_finished(shot_number, jpeg_only=True)
             return
@@ -2758,7 +3085,7 @@ class GPhotoGUI:
             return
 
         # Interwał liczony jest od rozpoczęcia poprzedniej ekspozycji.
-        # W trybie JPG proxy nie czekamy na żaden transfer RAW, więc kolejna
+        # W trybie pełny JPG nie czekamy na żaden transfer RAW, więc kolejna
         # klatka może ruszyć zgodnie z zadanym interwałem dużo wcześniej.
         elapsed = 0.0
         if self.series_last_start is not None:
@@ -2769,7 +3096,7 @@ class GPhotoGUI:
             self.series_interval - elapsed,
         )
 
-        mode_text = "RAW na SD; proxy JPG dopiero po serii" if jpeg_only else "JPEG + RAW na laptopie"
+        mode_text = "RAW+JPEG na SD; pełny JPG dopiero po serii" if jpeg_only else "JPEG + RAW na laptopie"
         self.status_var.set(
             f"Seria: {self.series_done}/{self.series_total}; {mode_text}; "
             f"następne za {wait_seconds:.1f} s"
@@ -3012,7 +3339,7 @@ class GPhotoGUI:
         image,
         max_size=None,
     ):
-        # Pracujemy na kopii, bo thumbnail modyfikuje obraz.
+        # Pracujemy na kopii, bo resize modyfikuje obraz.
         image = image.copy()
 
         # Obrót na podstawie EXIF.
